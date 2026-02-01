@@ -73,6 +73,13 @@ export { SqlJsBackend } from './sqljs-backend.js';
 export { CacheManager, TieredCacheManager } from './cache-manager.js';
 export { HNSWIndex } from './hnsw-index.js';
 export { MemoryMigrator, migrateMarkdownMemory } from './migration.js';
+export {
+  LocalEmbeddingsService,
+  createLocalEmbeddings,
+  createEmbeddingGenerator,
+  PersistentEmbeddingCache,
+  createPersistentEmbeddingCache,
+} from './embeddings/index.js';
 
 /**
  * Configuration for ProjectMemoryService
