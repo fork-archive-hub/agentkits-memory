@@ -398,7 +398,131 @@ export class ProjectMemoryService extends EventEmitter implements IMemoryBackend
 
   async query(query: MemoryQuery): Promise<MemoryEntry[]> {
     const backend = this.ensureInitialized();
-    return backend.query(query);
+
+    // If no content search term, just use basic query (ordered by date)
+    if (!query.content && !query.embedding) {
+      return backend.query(query);
+    }
+
+    // Handle different search types
+    // 'semantic' = vector only, 'hybrid' = combined, others fall back to FTS
+    const searchType = query.type || 'hybrid';
+    const limit = query.limit || 100;
+
+    // For exact, prefix, tag search - use backend directly
+    if (searchType === 'exact' || searchType === 'prefix' || searchType === 'tag') {
+      return backend.query(query);
+    }
+
+    // For semantic or hybrid search, need embedding
+    let embedding = query.embedding;
+    if (!embedding && query.content && this.config.embeddingGenerator) {
+      try {
+        embedding = await this.config.embeddingGenerator(query.content);
+      } catch (error) {
+        console.warn('[ProjectMemoryService] Failed to generate embedding, falling back to text search');
+        const betterBackend = backend as BetterSqlite3Backend;
+        if (typeof betterBackend.searchFts === 'function') {
+          return betterBackend.searchFts(query.content, {
+            namespace: query.namespace,
+            limit,
+          });
+        }
+        return backend.query(query);
+      }
+    }
+
+    if (!embedding) {
+      // No embedding available, fall back to FTS
+      const betterBackend = backend as BetterSqlite3Backend;
+      if (query.content && typeof betterBackend.searchFts === 'function') {
+        return betterBackend.searchFts(query.content, {
+          namespace: query.namespace,
+          limit,
+        });
+      }
+      return backend.query(query);
+    }
+
+    // For semantic-only (vector) search
+    if (searchType === 'semantic') {
+      const results = await this.search(embedding, {
+        k: limit,
+        threshold: query.threshold,
+      });
+
+      // Filter by namespace if specified
+      const filtered = query.namespace
+        ? results.filter((r) => r.entry.namespace === query.namespace)
+        : results;
+
+      return filtered.map((r) => r.entry);
+    }
+
+    // For hybrid search: combine FTS and vector results
+    const vectorResults = await this.search(embedding, {
+      k: limit * 2, // Get more candidates for fusion
+      threshold: 0.1, // Low threshold to get more candidates
+    });
+
+    // Filter vector results by namespace if specified
+    const filteredVectorResults = query.namespace
+      ? vectorResults.filter((r) => r.entry.namespace === query.namespace)
+      : vectorResults;
+
+    // Get FTS results
+    const betterBackend = backend as BetterSqlite3Backend;
+    let ftsResults: MemoryEntry[] = [];
+    if (query.content && typeof betterBackend.searchFts === 'function') {
+      ftsResults = await betterBackend.searchFts(query.content, {
+        namespace: query.namespace,
+        limit: limit * 2,
+      });
+    }
+
+    // Combine and rank results using score fusion
+    const scoreMap = new Map<string, { entry: MemoryEntry; score: number; vectorScore: number; ftsScore: number }>();
+
+    // Add vector results with scores (semantic weight: 0.7)
+    filteredVectorResults.forEach((r) => {
+      const vectorScore = r.score; // Already 0-1 similarity
+      scoreMap.set(r.entry.id, {
+        entry: r.entry,
+        score: vectorScore * 0.7,
+        vectorScore,
+        ftsScore: 0,
+      });
+    });
+
+    // Add FTS results with scores (keyword weight: 0.3)
+    ftsResults.forEach((entry, index) => {
+      const ftsScore = 1 - (index / (ftsResults.length || 1)); // Rank-based score
+      const existing = scoreMap.get(entry.id);
+      if (existing) {
+        existing.ftsScore = ftsScore;
+        existing.score += ftsScore * 0.3;
+      } else {
+        scoreMap.set(entry.id, {
+          entry,
+          score: ftsScore * 0.3,
+          vectorScore: 0,
+          ftsScore,
+        });
+      }
+    });
+
+    // Sort by combined score and return top results
+    const sorted = Array.from(scoreMap.values())
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit);
+
+    // Attach scores to entries for debugging/display
+    return sorted.map((r) => ({
+      ...r.entry,
+      _score: r.score,
+      _vectorScore: r.vectorScore,
+      _ftsScore: r.ftsScore,
+    }));
   }
 
   async search(embedding: Float32Array, options: SearchOptions): Promise<SearchResult[]> {
