@@ -81,6 +81,60 @@ export {
   createPersistentEmbeddingCache,
 } from './embeddings/index.js';
 
+export {
+  HybridSearchEngine,
+  createHybridSearchEngine,
+  TokenEconomicsTracker,
+  createTokenEconomicsTracker,
+} from './search/index.js';
+
+export {
+  BetterSqlite3Backend,
+  createBetterSqlite3Backend,
+  createJapaneseOptimizedBackend,
+} from './better-sqlite3-backend.js';
+
+/**
+ * Check if better-sqlite3 is available
+ */
+let _betterSqlite3Available: boolean | null = null;
+async function isBetterSqlite3Available(): Promise<boolean> {
+  if (_betterSqlite3Available !== null) return _betterSqlite3Available;
+  try {
+    await import('better-sqlite3');
+    _betterSqlite3Available = true;
+  } catch {
+    _betterSqlite3Available = false;
+  }
+  return _betterSqlite3Available;
+}
+
+/**
+ * Create the best available backend automatically
+ * - Uses better-sqlite3 if installed (faster, full CJK support)
+ * - Falls back to sql.js (WASM, works everywhere)
+ */
+export async function createAutoBackend(
+  databasePath: string,
+  options: { verbose?: boolean } = {}
+): Promise<IMemoryBackend> {
+  if (await isBetterSqlite3Available()) {
+    const { BetterSqlite3Backend } = await import('./better-sqlite3-backend.js');
+    const backend = new BetterSqlite3Backend({
+      databasePath,
+      ftsTokenizer: 'trigram', // Full CJK support
+      verbose: options.verbose,
+    });
+    return backend;
+  }
+
+  // Fallback to sql.js
+  return new SqlJsBackend({
+    databasePath,
+    verbose: options.verbose,
+  });
+}
+
 /**
  * Configuration for ProjectMemoryService
  */
@@ -147,7 +201,7 @@ const DEFAULT_CONFIG: ProjectMemoryConfig = {
  */
 export class ProjectMemoryService extends EventEmitter implements IMemoryBackend {
   private config: ProjectMemoryConfig;
-  private backend: SqlJsBackend;
+  private backend: IMemoryBackend | null = null;
   private cache: CacheManager<MemoryEntry> | null = null;
   private vectorIndex: HNSWIndex | null = null;
   private initialized: boolean = false;
@@ -168,14 +222,7 @@ export class ProjectMemoryService extends EventEmitter implements IMemoryBackend
       mkdirSync(this.config.baseDir, { recursive: true });
     }
 
-    // Initialize backend
-    const dbPath = path.join(this.config.baseDir, this.config.dbFilename);
-    this.backend = new SqlJsBackend({
-      databasePath: dbPath,
-      autoPersistInterval: this.config.autoPersistInterval,
-      maxEntries: this.config.maxEntries,
-      verbose: this.config.verbose,
-    });
+    // Backend is created lazily in initialize() for auto-detection
 
     // Initialize cache if enabled
     if (this.config.cacheEnabled) {
@@ -196,18 +243,25 @@ export class ProjectMemoryService extends EventEmitter implements IMemoryBackend
         metric: 'cosine',
       });
     }
-
-    // Forward backend events
-    this.backend.on('entry:stored', (data) => this.emit('entry:stored', data));
-    this.backend.on('entry:updated', (data) => this.emit('entry:updated', data));
-    this.backend.on('entry:deleted', (data) => this.emit('entry:deleted', data));
-    this.backend.on('persisted', (data) => this.emit('persisted', data));
   }
 
   // ===== Lifecycle =====
 
   async initialize(): Promise<void> {
     if (this.initialized) return;
+
+    // Create backend using auto-detection (better-sqlite3 if available, else sql.js)
+    const dbPath = path.join(this.config.baseDir, this.config.dbFilename);
+    this.backend = await createAutoBackend(dbPath, { verbose: this.config.verbose });
+
+    // Forward backend events (if backend is an EventEmitter)
+    const backendAsEmitter = this.backend as unknown as EventEmitter | undefined;
+    if (backendAsEmitter && typeof backendAsEmitter.on === 'function') {
+      backendAsEmitter.on('entry:stored', (data) => this.emit('entry:stored', data));
+      backendAsEmitter.on('entry:updated', (data) => this.emit('entry:updated', data));
+      backendAsEmitter.on('entry:deleted', (data) => this.emit('entry:deleted', data));
+      backendAsEmitter.on('persisted', (data) => this.emit('persisted', data));
+    }
 
     await this.backend.initialize();
 
@@ -233,7 +287,9 @@ export class ProjectMemoryService extends EventEmitter implements IMemoryBackend
       this.cache.shutdown();
     }
 
-    await this.backend.shutdown();
+    if (this.backend) {
+      await this.backend.shutdown();
+    }
     this.initialized = false;
     this.emit('shutdown');
   }
@@ -241,7 +297,7 @@ export class ProjectMemoryService extends EventEmitter implements IMemoryBackend
   // ===== IMemoryBackend Implementation =====
 
   async store(entry: MemoryEntry): Promise<void> {
-    this.ensureInitialized();
+    const backend = this.ensureInitialized();
 
     // Generate embedding if enabled and not present
     if (this.config.embeddingGenerator && !entry.embedding) {
@@ -260,7 +316,7 @@ export class ProjectMemoryService extends EventEmitter implements IMemoryBackend
     }
 
     // Store in backend
-    await this.backend.store(entry);
+    await backend.store(entry);
 
     // Update cache
     if (this.cache) {
@@ -275,7 +331,7 @@ export class ProjectMemoryService extends EventEmitter implements IMemoryBackend
   }
 
   async get(id: string): Promise<MemoryEntry | null> {
-    this.ensureInitialized();
+    const backend = this.ensureInitialized();
 
     // Check cache first
     if (this.cache) {
@@ -283,7 +339,7 @@ export class ProjectMemoryService extends EventEmitter implements IMemoryBackend
       if (cached) return cached;
     }
 
-    const entry = await this.backend.get(id);
+    const entry = await backend.get(id);
 
     // Update cache
     if (entry && this.cache) {
@@ -294,7 +350,7 @@ export class ProjectMemoryService extends EventEmitter implements IMemoryBackend
   }
 
   async getByKey(namespace: string, key: string): Promise<MemoryEntry | null> {
-    this.ensureInitialized();
+    const backend = this.ensureInitialized();
 
     const cacheKey = `${namespace}:${key}`;
 
@@ -304,7 +360,7 @@ export class ProjectMemoryService extends EventEmitter implements IMemoryBackend
       if (cached) return cached;
     }
 
-    const entry = await this.backend.getByKey(namespace, key);
+    const entry = await backend.getByKey(namespace, key);
 
     // Update cache
     if (entry && this.cache) {
@@ -316,16 +372,16 @@ export class ProjectMemoryService extends EventEmitter implements IMemoryBackend
   }
 
   async update(id: string, update: MemoryEntryUpdate): Promise<MemoryEntry | null> {
-    this.ensureInitialized();
+    const backend = this.ensureInitialized();
 
-    const updated = await this.backend.update(id, update);
+    const updated = await backend.update(id, update);
 
     if (updated) {
       // Regenerate embedding if content changed
       if (update.content && this.config.embeddingGenerator) {
         try {
           updated.embedding = await this.config.embeddingGenerator(updated.content);
-          await this.backend.store(updated);
+          await backend.store(updated);
 
           // Update vector index
           if (this.vectorIndex && updated.embedding) {
@@ -348,12 +404,12 @@ export class ProjectMemoryService extends EventEmitter implements IMemoryBackend
   }
 
   async delete(id: string): Promise<boolean> {
-    this.ensureInitialized();
+    const backend = this.ensureInitialized();
 
     const entry = await this.get(id);
     if (!entry) return false;
 
-    const result = await this.backend.delete(id);
+    const result = await backend.delete(id);
 
     if (result) {
       // Remove from cache
@@ -372,12 +428,12 @@ export class ProjectMemoryService extends EventEmitter implements IMemoryBackend
   }
 
   async query(query: MemoryQuery): Promise<MemoryEntry[]> {
-    this.ensureInitialized();
-    return this.backend.query(query);
+    const backend = this.ensureInitialized();
+    return backend.query(query);
   }
 
   async search(embedding: Float32Array, options: SearchOptions): Promise<SearchResult[]> {
-    this.ensureInitialized();
+    const backend = this.ensureInitialized();
 
     if (this.vectorIndex) {
       // Use HNSW index for fast search
@@ -399,11 +455,11 @@ export class ProjectMemoryService extends EventEmitter implements IMemoryBackend
     }
 
     // Fallback to brute-force search in backend
-    return this.backend.search(embedding, options);
+    return backend.search(embedding, options);
   }
 
   async bulkInsert(entries: MemoryEntry[]): Promise<void> {
-    this.ensureInitialized();
+    this.ensureInitialized(); // store() already gets backend
 
     for (const entry of entries) {
       await this.store(entry);
@@ -425,30 +481,30 @@ export class ProjectMemoryService extends EventEmitter implements IMemoryBackend
   }
 
   async count(namespace?: string): Promise<number> {
-    this.ensureInitialized();
-    return this.backend.count(namespace);
+    const backend = this.ensureInitialized();
+    return backend.count(namespace);
   }
 
   async listNamespaces(): Promise<string[]> {
-    this.ensureInitialized();
-    return this.backend.listNamespaces();
+    const backend = this.ensureInitialized();
+    return backend.listNamespaces();
   }
 
   async clearNamespace(namespace: string): Promise<number> {
-    this.ensureInitialized();
+    const backend = this.ensureInitialized();
 
     // Clear from cache
     if (this.cache) {
       this.cache.invalidatePattern(new RegExp(`^${namespace}:`));
     }
 
-    return this.backend.clearNamespace(namespace);
+    return backend.clearNamespace(namespace);
   }
 
   async getStats(): Promise<BackendStats> {
-    this.ensureInitialized();
+    const backend = this.ensureInitialized();
 
-    const stats = await this.backend.getStats();
+    const stats = await backend.getStats();
 
     // Add HNSW stats if available
     if (this.vectorIndex) {
@@ -464,8 +520,8 @@ export class ProjectMemoryService extends EventEmitter implements IMemoryBackend
   }
 
   async healthCheck(): Promise<HealthCheckResult> {
-    this.ensureInitialized();
-    return this.backend.healthCheck();
+    const backend = this.ensureInitialized();
+    return backend.healthCheck();
   }
 
   // ===== Convenience Methods =====
@@ -698,10 +754,11 @@ export class ProjectMemoryService extends EventEmitter implements IMemoryBackend
 
   // ===== Private Methods =====
 
-  private ensureInitialized(): void {
-    if (!this.initialized) {
+  private ensureInitialized(): IMemoryBackend {
+    if (!this.initialized || !this.backend) {
       throw new Error('ProjectMemoryService not initialized. Call initialize() first.');
     }
+    return this.backend;
   }
 
   private async rebuildVectorIndex(): Promise<void> {

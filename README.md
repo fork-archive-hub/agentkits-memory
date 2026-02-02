@@ -226,6 +226,58 @@ Memories are stored in `.claude/memory/memory.db` within your project directory.
 
 ---
 
+## CJK Language Support
+
+AgentKits Memory has **automatic CJK support** for Chinese, Japanese, and Korean text search.
+
+### Zero Configuration
+
+When `better-sqlite3` is installed (default), CJK search works automatically:
+
+```typescript
+import { ProjectMemoryService } from '@aitytech/agentkits-memory';
+
+const memory = new ProjectMemoryService('.claude/memory');
+await memory.initialize();
+
+// Store CJK content
+await memory.storeEntry({
+  key: 'auth-pattern',
+  content: '認証機能の実装パターン - JWT with refresh tokens',
+  namespace: 'patterns',
+});
+
+// Search in Japanese, Chinese, or Korean - it just works!
+const results = await memory.query({
+  type: 'hybrid',
+  content: '認証機能',
+});
+```
+
+### How It Works
+
+- **Auto-detection**: Uses `better-sqlite3` if installed (native, fast, CJK support)
+- **Fallback**: Falls back to `sql.js` if better-sqlite3 unavailable
+- **Trigram tokenizer**: Creates 3-character sequences for CJK matching
+- **BM25 ranking**: Relevance scoring for search results
+
+### Advanced: Japanese Word Segmentation
+
+For advanced Japanese with proper word segmentation, optionally use lindera:
+
+```typescript
+import { createJapaneseOptimizedBackend } from '@aitytech/agentkits-memory';
+
+const backend = createJapaneseOptimizedBackend({
+  databasePath: '.claude/memory/memory.db',
+  linderaPath: './path/to/liblindera_sqlite.dylib',
+});
+```
+
+Requires [lindera-sqlite](https://github.com/lindera/lindera-sqlite) build.
+
+---
+
 ## API Reference
 
 ### ProjectMemoryService

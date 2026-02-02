@@ -13,8 +13,8 @@
 import * as http from 'node:http';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { createRequire } from 'node:module';
-import initSqlJs, { Database as SqlJsDatabase } from 'sql.js';
+import Database from 'better-sqlite3';
+import type { Database as BetterDatabase } from 'better-sqlite3';
 
 const args = process.argv.slice(2);
 const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
@@ -36,37 +36,24 @@ const PORT = parseInt(options.port as string, 10) || 1905;
 const dbDir = path.join(projectDir, '.claude/memory');
 const dbPath = path.join(dbDir, 'memory.db');
 
-let SQL: Awaited<ReturnType<typeof initSqlJs>>;
+// Singleton database connection
+let _db: BetterDatabase | null = null;
 
-async function initSQL(): Promise<void> {
-  if (!SQL) {
-    const require = createRequire(import.meta.url);
-    const sqlJsPath = require.resolve('sql.js');
-    SQL = await initSqlJs({
-      locateFile: (file: string) => path.join(path.dirname(sqlJsPath), file),
-    });
-  }
-}
-
-async function loadOrCreateDatabase(): Promise<SqlJsDatabase> {
-  await initSQL();
+function getDatabase(): BetterDatabase {
+  if (_db) return _db;
 
   // Ensure directory exists
   if (!fs.existsSync(dbDir)) {
     fs.mkdirSync(dbDir, { recursive: true });
   }
 
-  let db: SqlJsDatabase;
+  _db = new Database(dbPath);
 
-  if (fs.existsSync(dbPath)) {
-    const buffer = fs.readFileSync(dbPath);
-    db = new SQL.Database(new Uint8Array(buffer));
-  } else {
-    db = new SQL.Database();
-  }
+  // Enable WAL mode for better performance
+  _db.pragma('journal_mode = WAL');
 
   // Create table if not exists
-  db.run(`
+  _db.exec(`
     CREATE TABLE IF NOT EXISTS memory_entries (
       id TEXT PRIMARY KEY,
       key TEXT NOT NULL,
@@ -85,52 +72,92 @@ async function loadOrCreateDatabase(): Promise<SqlJsDatabase> {
     )
   `);
 
-  db.run(`CREATE INDEX IF NOT EXISTS idx_namespace ON memory_entries(namespace)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_key ON memory_entries(key)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_created ON memory_entries(created_at)`);
+  _db.exec(`CREATE INDEX IF NOT EXISTS idx_namespace ON memory_entries(namespace)`);
+  _db.exec(`CREATE INDEX IF NOT EXISTS idx_key ON memory_entries(key)`);
+  _db.exec(`CREATE INDEX IF NOT EXISTS idx_created ON memory_entries(created_at)`);
 
-  return db;
-}
+  // Create FTS5 table with trigram tokenizer for CJK support
+  try {
+    _db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+        id,
+        key,
+        content,
+        tags,
+        tokenize='trigram'
+      )
+    `);
 
-function saveDatabase(db: SqlJsDatabase): void {
-  const data = db.export();
-  const buffer = Buffer.from(data);
-  fs.writeFileSync(dbPath, buffer);
+    // Populate FTS table with existing entries
+    _db.exec(`
+      INSERT OR IGNORE INTO memory_fts(id, key, content, tags)
+      SELECT id, key, content, tags FROM memory_entries
+    `);
+  } catch (e) {
+    console.warn('[WebViewer] FTS5 trigram not available:', (e as Error).message);
+  }
+
+  return _db;
 }
 
 function generateId(): string {
   return `mem_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function getStats(db: SqlJsDatabase): {
+function getStats(db: BetterDatabase): {
   total: number;
   byNamespace: Record<string, number>;
   byType: Record<string, number>;
+  tokenEconomics: {
+    totalTokens: number;
+    avgTokensPerEntry: number;
+    totalCharacters: number;
+    estimatedSavings: number;
+  };
 } {
-  const totalResult = db.exec('SELECT COUNT(*) as count FROM memory_entries');
-  const total = (totalResult[0]?.values[0]?.[0] as number) || 0;
+  const totalRow = db.prepare('SELECT COUNT(*) as count FROM memory_entries').get() as { count: number };
+  const total = totalRow?.count || 0;
 
-  const nsResult = db.exec('SELECT namespace, COUNT(*) FROM memory_entries GROUP BY namespace');
+  const nsRows = db.prepare('SELECT namespace, COUNT(*) as count FROM memory_entries GROUP BY namespace').all() as { namespace: string; count: number }[];
   const byNamespace: Record<string, number> = {};
-  if (nsResult[0]) {
-    for (const row of nsResult[0].values) {
-      byNamespace[row[0] as string] = row[1] as number;
-    }
+  for (const row of nsRows) {
+    byNamespace[row.namespace] = row.count;
   }
 
-  const typeResult = db.exec('SELECT type, COUNT(*) FROM memory_entries GROUP BY type');
+  const typeRows = db.prepare('SELECT type, COUNT(*) as count FROM memory_entries GROUP BY type').all() as { type: string; count: number }[];
   const byType: Record<string, number> = {};
-  if (typeResult[0]) {
-    for (const row of typeResult[0].values) {
-      byType[row[0] as string] = row[1] as number;
-    }
+  for (const row of typeRows) {
+    byType[row.type] = row.count;
   }
 
-  return { total, byNamespace, byType };
+  // Calculate token economics
+  const contentRow = db.prepare('SELECT SUM(LENGTH(content)) as total_chars, COUNT(*) as count FROM memory_entries').get() as { total_chars: number; count: number };
+  const totalCharacters = contentRow?.total_chars || 0;
+  const entryCount = contentRow?.count || 0;
+
+  // Estimate tokens (~4 chars per token)
+  const totalTokens = Math.ceil(totalCharacters / 4);
+  const avgTokensPerEntry = entryCount > 0 ? Math.ceil(totalTokens / entryCount) : 0;
+
+  // Estimated savings: if you had to rediscover this info each time
+  // Assume 5x overhead for discovery vs recall
+  const estimatedSavings = totalTokens * 5;
+
+  return {
+    total,
+    byNamespace,
+    byType,
+    tokenEconomics: {
+      totalTokens,
+      avgTokensPerEntry,
+      totalCharacters,
+      estimatedSavings,
+    },
+  };
 }
 
 function getEntries(
-  db: SqlJsDatabase,
+  db: BetterDatabase,
   namespace?: string,
   limit = 50,
   offset = 0,
@@ -145,6 +172,46 @@ function getEntries(
   created_at: number;
   updated_at: number;
 }> {
+  // Use FTS5 search for better CJK support
+  if (search && search.trim()) {
+    const sanitizedSearch = search.trim().replace(/"/g, '""');
+    let ftsQuery = `
+      SELECT m.id, m.key, m.content, m.type, m.namespace, m.tags, m.created_at, m.updated_at
+      FROM memory_entries m
+      INNER JOIN memory_fts f ON m.id = f.id
+      WHERE memory_fts MATCH '"${sanitizedSearch}"'
+    `;
+
+    if (namespace) {
+      ftsQuery += ` AND m.namespace = ?`;
+    }
+
+    ftsQuery += ` ORDER BY m.created_at DESC LIMIT ? OFFSET ?`;
+
+    try {
+      const params = namespace ? [namespace, limit, offset] : [limit, offset];
+      const rows = db.prepare(ftsQuery).all(...params) as {
+        id: string;
+        key: string;
+        content: string;
+        type: string;
+        namespace: string;
+        tags: string;
+        created_at: number;
+        updated_at: number;
+      }[];
+
+      return rows.map((row) => ({
+        ...row,
+        tags: JSON.parse(row.tags || '[]'),
+      }));
+    } catch {
+      // Fallback to LIKE if FTS fails
+      console.warn('[WebViewer] FTS search failed, falling back to LIKE');
+    }
+  }
+
+  // Standard query (no search or FTS fallback)
   let query = 'SELECT id, key, content, type, namespace, tags, created_at, updated_at FROM memory_entries';
   const conditions: string[] = [];
   const params: (string | number)[] = [];
@@ -154,7 +221,7 @@ function getEntries(
     params.push(namespace);
   }
 
-  if (search) {
+  if (search && search.trim()) {
     conditions.push('(content LIKE ? OR key LIKE ? OR tags LIKE ?)');
     const searchPattern = `%${search}%`;
     params.push(searchPattern, searchPattern, searchPattern);
@@ -167,36 +234,21 @@ function getEntries(
   query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
   params.push(limit, offset);
 
-  const stmt = db.prepare(query);
-  stmt.bind(params);
-
-  const entries: Array<{
+  const rows = db.prepare(query).all(...params) as {
     id: string;
     key: string;
     content: string;
     type: string;
     namespace: string;
-    tags: string[];
+    tags: string;
     created_at: number;
     updated_at: number;
-  }> = [];
+  }[];
 
-  while (stmt.step()) {
-    const row = stmt.getAsObject();
-    entries.push({
-      id: row.id as string,
-      key: row.key as string,
-      content: row.content as string,
-      type: row.type as string,
-      namespace: row.namespace as string,
-      tags: JSON.parse((row.tags as string) || '[]'),
-      created_at: row.created_at as number,
-      updated_at: row.updated_at as number,
-    });
-  }
-  stmt.free();
-
-  return entries;
+  return rows.map((row) => ({
+    ...row,
+    tags: JSON.parse(row.tags || '[]'),
+  }));
 }
 
 function getHTML(): string {
@@ -756,6 +808,7 @@ function getHTML(): string {
 
     function renderStats() {
       const container = document.getElementById('stats-container');
+      const te = stats.tokenEconomics || { totalTokens: 0, avgTokensPerEntry: 0, estimatedSavings: 0 };
       container.innerHTML = \`
         <div class="stat-card">
           <div class="stat-label">Total Memories</div>
@@ -766,8 +819,16 @@ function getHTML(): string {
           <div class="stat-value">\${Object.keys(stats.byNamespace || {}).length}</div>
         </div>
         <div class="stat-card">
-          <div class="stat-label">Types</div>
-          <div class="stat-value">\${Object.keys(stats.byType || {}).length}</div>
+          <div class="stat-label">Total Tokens</div>
+          <div class="stat-value">\${(te.totalTokens || 0).toLocaleString()}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Avg Tokens/Entry</div>
+          <div class="stat-value">\${te.avgTokensPerEntry || 0}</div>
+        </div>
+        <div class="stat-card" style="background: linear-gradient(135deg, rgba(34, 197, 94, 0.2), rgba(16, 185, 129, 0.1));">
+          <div class="stat-label" style="color: #22C55E;">💰 Est. Tokens Saved</div>
+          <div class="stat-value" style="color: #22C55E;">\${(te.estimatedSavings || 0).toLocaleString()}</div>
         </div>
       \`;
     }
@@ -1060,24 +1121,23 @@ async function readBody(req: http.IncomingMessage): Promise<string> {
   });
 }
 
-async function handleRequest(
+function handleRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse
-): Promise<void> {
+): void {
   const url = new URL(req.url || '/', `http://localhost:${PORT}`);
   const method = req.method || 'GET';
 
   res.setHeader('Content-Type', 'application/json');
 
   try {
-    const db = await loadOrCreateDatabase();
+    const db = getDatabase();
 
     // Serve HTML
     if (url.pathname === '/' && method === 'GET') {
       res.setHeader('Content-Type', 'text/html');
       res.writeHead(200);
       res.end(getHTML());
-      db.close();
       return;
     }
 
@@ -1086,7 +1146,6 @@ async function handleRequest(
       const stats = getStats(db);
       res.writeHead(200);
       res.end(JSON.stringify(stats));
-      db.close();
       return;
     }
 
@@ -1100,38 +1159,53 @@ async function handleRequest(
       const entries = getEntries(db, namespace, limit, offset, search);
       res.writeHead(200);
       res.end(JSON.stringify(entries));
-      db.close();
       return;
     }
 
     // POST create entry
     if (url.pathname === '/api/entries' && method === 'POST') {
-      const body = await readBody(req);
-      const data = JSON.parse(body);
-      const now = Date.now();
-      const id = generateId();
+      readBody(req).then((body) => {
+        const data = JSON.parse(body);
+        const now = Date.now();
+        const id = generateId();
+        const tags = JSON.stringify(data.tags || []);
 
-      db.run(
-        `INSERT INTO memory_entries (id, key, content, type, namespace, tags, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [id, data.key, data.content, data.type || 'semantic', data.namespace || 'general', JSON.stringify(data.tags || []), now, now]
-      );
+        db.prepare(
+          `INSERT INTO memory_entries (id, key, content, type, namespace, tags, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(id, data.key, data.content, data.type || 'semantic', data.namespace || 'general', tags, now, now);
 
-      saveDatabase(db);
-      res.writeHead(201);
-      res.end(JSON.stringify({ id, success: true }));
-      db.close();
+        // Also insert into FTS table
+        try {
+          db.prepare(
+            `INSERT INTO memory_fts (id, key, content, tags) VALUES (?, ?, ?, ?)`
+          ).run(id, data.key, data.content, tags);
+        } catch { /* FTS may not be available */ }
+
+        res.writeHead(201);
+        res.end(JSON.stringify({ id, success: true }));
+      }).catch((error) => {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'Internal error' }));
+      });
       return;
     }
 
     // GET single entry
     if (url.pathname.startsWith('/api/entry/') && method === 'GET') {
       const id = url.pathname.split('/').pop();
-      const stmt = db.prepare('SELECT * FROM memory_entries WHERE id = ?');
-      stmt.bind([id]);
+      const row = db.prepare('SELECT * FROM memory_entries WHERE id = ?').get(id) as {
+        id: string;
+        key: string;
+        content: string;
+        type: string;
+        namespace: string;
+        tags: string;
+        created_at: number;
+        updated_at: number;
+      } | undefined;
 
-      if (stmt.step()) {
-        const row = stmt.getAsObject();
+      if (row) {
         res.writeHead(200);
         res.end(JSON.stringify({
           id: row.id,
@@ -1139,7 +1213,7 @@ async function handleRequest(
           content: row.content,
           type: row.type,
           namespace: row.namespace,
-          tags: JSON.parse((row.tags as string) || '[]'),
+          tags: JSON.parse(row.tags || '[]'),
           created_at: row.created_at,
           updated_at: row.updated_at,
         }));
@@ -1147,45 +1221,53 @@ async function handleRequest(
         res.writeHead(404);
         res.end(JSON.stringify({ error: 'Entry not found' }));
       }
-      stmt.free();
-      db.close();
       return;
     }
 
     // PUT update entry
     if (url.pathname.startsWith('/api/entry/') && method === 'PUT') {
       const id = url.pathname.split('/').pop();
-      const body = await readBody(req);
-      const data = JSON.parse(body);
-      const now = Date.now();
+      readBody(req).then((body) => {
+        const data = JSON.parse(body);
+        const now = Date.now();
+        const tags = JSON.stringify(data.tags || []);
 
-      db.run(
-        `UPDATE memory_entries SET key = ?, content = ?, type = ?, namespace = ?, tags = ?, updated_at = ?
-         WHERE id = ?`,
-        [data.key, data.content, data.type, data.namespace, JSON.stringify(data.tags || []), now, id]
-      );
+        db.prepare(
+          `UPDATE memory_entries SET key = ?, content = ?, type = ?, namespace = ?, tags = ?, updated_at = ?
+           WHERE id = ?`
+        ).run(data.key, data.content, data.type, data.namespace, tags, now, id);
 
-      saveDatabase(db);
-      res.writeHead(200);
-      res.end(JSON.stringify({ success: true }));
-      db.close();
+        // Also update FTS table
+        try {
+          db.prepare(`DELETE FROM memory_fts WHERE id = ?`).run(id);
+          db.prepare(
+            `INSERT INTO memory_fts (id, key, content, tags) VALUES (?, ?, ?, ?)`
+          ).run(id, data.key, data.content, tags);
+        } catch { /* FTS may not be available */ }
+
+        res.writeHead(200);
+        res.end(JSON.stringify({ success: true }));
+      }).catch((error) => {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'Internal error' }));
+      });
       return;
     }
 
     // DELETE entry
     if (url.pathname.startsWith('/api/entry/') && method === 'DELETE') {
       const id = url.pathname.split('/').pop();
-      db.run('DELETE FROM memory_entries WHERE id = ?', [id]);
-      saveDatabase(db);
+      db.prepare('DELETE FROM memory_entries WHERE id = ?').run(id);
+      try {
+        db.prepare('DELETE FROM memory_fts WHERE id = ?').run(id);
+      } catch { /* FTS may not be available */ }
       res.writeHead(200);
       res.end(JSON.stringify({ success: true }));
-      db.close();
       return;
     }
 
     res.writeHead(404);
     res.end(JSON.stringify({ error: 'Not found' }));
-    db.close();
   } catch (error) {
     res.writeHead(500);
     res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'Internal error' }));
