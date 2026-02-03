@@ -432,6 +432,11 @@ describe('Hook Types Utilities', () => {
       const subtitle = generateObservationSubtitle('CustomTool', {});
       expect(subtitle).toBe('Using CustomTool tool');
     });
+
+    it('should handle generateObservationSubtitle catch (unparseable string input)', () => {
+      const subtitle = generateObservationSubtitle('Read', 'invalid json {{{');
+      expect(subtitle).toContain('Read');
+    });
   });
 
   describe('generateObservationNarrative', () => {
@@ -466,6 +471,54 @@ describe('Hook Types Utilities', () => {
     it('should handle unknown tools', () => {
       const narrative = generateObservationNarrative('CustomTool', {});
       expect(narrative).toBe('Used CustomTool tool.');
+    });
+
+    it('should generate narrative for Edit tool', () => {
+      const narrative = generateObservationNarrative('Edit', { file_path: '/src/utils.ts', old_string: 'const x = 1' });
+      expect(narrative).toContain('/src/utils.ts');
+      expect(narrative).toContain('Edited');
+      expect(narrative).toContain('const x = 1');
+    });
+
+    it('should generate narrative for MultiEdit tool', () => {
+      const narrative = generateObservationNarrative('MultiEdit', { file_path: '/src/app.ts' });
+      expect(narrative).toContain('/src/app.ts');
+      expect(narrative).toContain('Edited');
+      // No old_string provided — should show 'code' as fallback
+      expect(narrative).toContain('code');
+    });
+
+    it('should generate narrative for Glob tool', () => {
+      const narrative = generateObservationNarrative('Glob', { pattern: '**/*.tsx' });
+      expect(narrative).toContain('**/*.tsx');
+      expect(narrative).toContain('Searched');
+    });
+
+    it('should generate narrative for Task tool', () => {
+      const narrative = generateObservationNarrative('Task', { description: 'explore code', subagent_type: 'Explore' });
+      expect(narrative).toContain('Explore');
+      expect(narrative).toContain('explore code');
+      expect(narrative).toContain('Delegated');
+    });
+
+    it('should generate narrative for WebSearch tool', () => {
+      const narrative = generateObservationNarrative('WebSearch', { query: 'react hooks' });
+      expect(narrative).toContain('react hooks');
+    });
+
+    it('should generate narrative for WebFetch tool', () => {
+      const narrative = generateObservationNarrative('WebFetch', { url: 'https://docs.example.com' });
+      expect(narrative).toContain('https://docs.example.com');
+    });
+
+    it('should handle generateObservationNarrative catch (unparseable string input)', () => {
+      const narrative = generateObservationNarrative('Read', 'invalid json {{{');
+      expect(narrative).toBe('Used Read tool.');
+    });
+
+    it('should generate narrative for Bash git commands', () => {
+      const narrative = generateObservationNarrative('Bash', { command: 'git status' });
+      expect(narrative).toContain('git');
     });
   });
 
@@ -506,6 +559,49 @@ describe('Hook Types Utilities', () => {
     it('should handle null inputs', () => {
       const facts = extractFacts('Read', null, null);
       expect(facts).toEqual([]);
+    });
+
+    it('should extract facts from Glob', () => {
+      const facts = extractFacts('Glob', { pattern: '**/*.ts' }, {});
+      expect(facts).toContain('Pattern searched: **/*.ts');
+    });
+
+    it('should extract facts from Grep', () => {
+      const facts = extractFacts('Grep', { pattern: 'TODO', path: 'src/' }, {});
+      expect(facts).toContain('Code pattern searched: TODO');
+      expect(facts).toContain('Search scope: src/');
+    });
+
+    it('should extract facts from WebFetch', () => {
+      const facts = extractFacts('WebFetch', { url: 'https://example.com' }, {});
+      expect(facts).toContain('URL fetched: https://example.com');
+    });
+
+    it('should extract facts from Task', () => {
+      const facts = extractFacts('Task', { description: 'Find files', subagent_type: 'Explore' }, {});
+      expect(facts).toContain('Sub-task: Find files');
+      expect(facts).toContain('Agent type: Explore');
+    });
+
+    it('should extract test failed facts from Bash', () => {
+      const facts = extractFacts('Bash', { command: 'npm test' }, { stdout: '2 tests failed ✗' });
+      expect(facts).toContain('Tests failed');
+    });
+
+    it('should extract error facts from Bash', () => {
+      const facts = extractFacts('Bash', { command: 'tsc' }, { stdout: 'Error: something went wrong' });
+      expect(facts).toContain('Errors encountered');
+    });
+
+    it('should handle MultiEdit like Edit', () => {
+      const facts = extractFacts('MultiEdit', { file_path: 'app.ts', old_string: 'old' }, {});
+      expect(facts).toContain('File modified: app.ts');
+      expect(facts.some(f => f.includes('Code replaced'))).toBe(true);
+    });
+
+    it('should handle string toolInput (JSON string)', () => {
+      const facts = extractFacts('Read', JSON.stringify({ file_path: 'test.ts' }), '{}');
+      expect(facts).toContain('File read: test.ts');
     });
   });
 

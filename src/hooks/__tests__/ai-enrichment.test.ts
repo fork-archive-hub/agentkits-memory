@@ -553,6 +553,13 @@ describe('AI Enrichment Module', () => {
       expect(result!.completed).toBe('Done.');
     });
 
+    it('should strip plain ``` markdown fences (without json suffix)', () => {
+      const json = '```\n{"completed":"Done.","nextSteps":"None"}\n```';
+      const result = parseSummaryResponse(json);
+      expect(result).not.toBeNull();
+      expect(result!.completed).toBe('Done.');
+    });
+
     it('should return null for invalid JSON', () => {
       expect(parseSummaryResponse('not json')).toBeNull();
     });
@@ -606,6 +613,22 @@ describe('AI Enrichment Module', () => {
     it('should return null when CLI returns invalid response', async () => {
       delete process.env.AGENTKITS_AI_ENRICHMENT;
       _setRunClaudePrintMockForTesting(() => 'not json');
+
+      const result = await enrichSummaryWithAI('Request: Fix bug', 'I fixed it.');
+      expect(result).toBeNull();
+    });
+
+    it('should return null when runClaudePrint throws (catch block)', async () => {
+      delete process.env.AGENTKITS_AI_ENRICHMENT;
+      _setRunClaudePrintMockForTesting(() => { throw new Error('Unexpected CLI error'); });
+
+      const result = await enrichSummaryWithAI('Request: Fix bug', 'I fixed it.');
+      expect(result).toBeNull();
+    });
+
+    it('should return null when runClaudePrint returns null', async () => {
+      delete process.env.AGENTKITS_AI_ENRICHMENT;
+      _setRunClaudePrintMockForTesting(() => null as unknown as string);
 
       const result = await enrichSummaryWithAI('Request: Fix bug', 'I fixed it.');
       expect(result).toBeNull();

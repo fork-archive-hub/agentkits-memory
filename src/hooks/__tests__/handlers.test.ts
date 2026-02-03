@@ -403,6 +403,43 @@ describe('Hook Handlers', () => {
       }
     });
 
+    it('should skip empty/no-op tool calls (both input and response are {})', async () => {
+      const hook = trackHook(createObservationHook(TEST_DIR));
+      const input = createTestInput({
+        toolName: 'Read',
+        toolInput: {},
+        toolResponse: {},
+      });
+
+      const result = await hook.execute(input);
+
+      expect(result.continue).toBe(true);
+      expect(result.suppressOutput).toBe(true);
+
+      // Should NOT initialize service or store anything
+      // Verify by checking no observations exist
+      const service = new MemoryHookService(TEST_DIR);
+      await service.initialize();
+      const observations = await service.getSessionObservations('test-session-123');
+      await service.shutdown();
+
+      expect(observations.length).toBe(0);
+    });
+
+    it('should skip when toolInput is undefined and toolResponse is undefined', async () => {
+      const hook = trackHook(createObservationHook(TEST_DIR));
+      const input = createTestInput({
+        toolName: 'Bash',
+        toolInput: undefined,
+        toolResponse: undefined,
+      });
+
+      const result = await hook.execute(input);
+
+      expect(result.continue).toBe(true);
+      expect(result.suppressOutput).toBe(true);
+    });
+
     it('should handle errors gracefully', async () => {
       const hook = new ObservationHook({
         initialize: async () => { throw new Error('Test error'); },
@@ -471,6 +508,66 @@ describe('Hook Handlers', () => {
 
       expect(result.continue).toBe(true);
       expect(result.suppressOutput).toBe(true);
+    });
+
+    it('should spawn enrich worker when AI enrichment is enabled', async () => {
+      const originalEnv = process.env.AGENTKITS_AI_ENRICHMENT;
+      process.env.AGENTKITS_AI_ENRICHMENT = 'true';
+
+      try {
+        // Set up session with observations
+        const service = new MemoryHookService(TEST_DIR);
+        await service.initSession('test-session-123', 'test-project', 'Test task');
+        await service.storeObservation('test-session-123', 'test-project', 'Read', { file_path: 'a.ts' }, {}, TEST_DIR);
+        await service.shutdown();
+
+        // Run summarize hook
+        const hook = trackHook(createSummarizeHook(TEST_DIR));
+        const input = createTestInput();
+
+        const result = await hook.execute(input);
+
+        // Hook should still succeed (worker spawn is fire-and-forget)
+        expect(result.continue).toBe(true);
+        expect(result.suppressOutput).toBe(true);
+      } finally {
+        if (originalEnv === undefined) {
+          delete process.env.AGENTKITS_AI_ENRICHMENT;
+        } else {
+          process.env.AGENTKITS_AI_ENRICHMENT = originalEnv;
+        }
+      }
+    });
+
+    it('should spawn enrich-summary process when AI enrichment enabled and transcriptPath provided', async () => {
+      const originalEnv = process.env.AGENTKITS_AI_ENRICHMENT;
+      process.env.AGENTKITS_AI_ENRICHMENT = 'true';
+
+      try {
+        // Set up session
+        const service = new MemoryHookService(TEST_DIR);
+        await service.initSession('test-session-123', 'test-project', 'Test task');
+        await service.storeObservation('test-session-123', 'test-project', 'Read', { file_path: 'a.ts' }, {}, TEST_DIR);
+        await service.shutdown();
+
+        // Run summarize hook with transcriptPath
+        const hook = trackHook(createSummarizeHook(TEST_DIR));
+        const input = createTestInput({
+          transcriptPath: '/tmp/test-transcript.jsonl',
+        });
+
+        const result = await hook.execute(input);
+
+        // Hook should still succeed (spawn is fire-and-forget, spawn failure is caught)
+        expect(result.continue).toBe(true);
+        expect(result.suppressOutput).toBe(true);
+      } finally {
+        if (originalEnv === undefined) {
+          delete process.env.AGENTKITS_AI_ENRICHMENT;
+        } else {
+          process.env.AGENTKITS_AI_ENRICHMENT = originalEnv;
+        }
+      }
     });
 
     it('should handle errors gracefully', async () => {
