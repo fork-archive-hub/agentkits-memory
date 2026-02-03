@@ -2146,6 +2146,8 @@ function getHTML(): string {
           for (const o of observations) {
             items.push({ type: 'observation', time: o.timestamp, sessionId: o.session_id,
               toolName: o.tool_name, title: o.title, obsType: o.type, promptNumber: o.prompt_number,
+              subtitle: o.subtitle, narrative: o.narrative, concepts: o.concepts,
+              compressedSummary: o.compressed_summary, isCompressed: o.is_compressed,
               hasEmbedding: !!o.hasEmbedding });
           }
           totalItems = items.length;
@@ -2178,28 +2180,47 @@ function getHTML(): string {
             : '<span class="vector-badge no-vector" title="Not indexed">--</span>';
 
           if (item.type === 'prompt') {
+            const promptId = 'prompt_' + Math.random().toString(36).slice(2, 8);
+            const promptText = item.text || '';
+            const isLong = promptText.length > 200;
             return \`<div class="entry-card" style="border-left:3px solid var(--accent);">
               <div class="entry-header">
                 <span class="entry-type" style="background:#3B82F6;color:white;padding:2px 8px;border-radius:4px;font-size:11px;">PROMPT #\${item.promptNumber || '?'}</span>
                 <div class="entry-badges">\${scoreBadge}\${vecBadge}<span class="entry-meta">\${time} · \${sid}</span></div>
               </div>
-              <div class="entry-content" style="margin-top:8px;white-space:pre-wrap;overflow:hidden;">\${escapeHtml(truncate(item.text, 300))}</div>
+              <div class="entry-content" style="margin-top:8px;white-space:pre-wrap;overflow:hidden;">
+                \${isLong ? '<span id="' + promptId + '_short">' + escapeHtml(truncate(promptText, 200)) + ' <a href="#" onclick="toggleExpand(\\'' + promptId + '\\');return false;" style="color:var(--accent);font-size:12px;">show more</a></span><span id="' + promptId + '_full" style="display:none;">' + escapeHtml(promptText) + ' <a href="#" onclick="toggleExpand(\\'' + promptId + '\\');return false;" style="color:var(--accent);font-size:12px;">show less</a></span>' : escapeHtml(promptText)}
+              </div>
             </div>\`;
           }
 
           if (item.type === 'summary') {
+            const sumId = 'sum_' + Math.random().toString(36).slice(2, 8);
             let filesStr = '';
             try { filesStr = JSON.parse(item.filesModified || '[]').join(', '); } catch {}
+            const requestText = item.request || '';
+            const completedText = item.completed || '';
+            const isLong = requestText.length > 150 || completedText.length > 150 || filesStr.length > 150;
             return \`<div class="entry-card" style="border-left:3px solid var(--success);">
               <div class="entry-header">
                 <span class="entry-type" style="background:#22C55E;color:white;padding:2px 8px;border-radius:4px;font-size:11px;">SUMMARY</span>
                 <div class="entry-badges">\${scoreBadge}\${vecBadge}<span class="entry-meta">\${time} · \${sid}</span></div>
               </div>
               <div style="margin-top:8px;">
-                \${item.request ? '<div><strong>Request:</strong> ' + escapeHtml(truncate(item.request, 250)) + '</div>' : ''}
-                \${item.completed ? '<div><strong>Completed:</strong> ' + escapeHtml(truncate(item.completed, 250)) + '</div>' : ''}
-                \${filesStr ? '<div><strong>Files:</strong> ' + escapeHtml(truncate(filesStr, 200)) + '</div>' : ''}
-                \${item.nextSteps ? '<div><strong>Next:</strong> ' + escapeHtml(truncate(item.nextSteps, 200)) + '</div>' : ''}
+                <span id="\${sumId}_short">
+                  \${requestText ? '<div><strong>Request:</strong> ' + escapeHtml(truncate(requestText, 150)) + '</div>' : ''}
+                  \${completedText ? '<div><strong>Completed:</strong> ' + escapeHtml(truncate(completedText, 150)) + '</div>' : ''}
+                  \${filesStr ? '<div><strong>Files:</strong> ' + escapeHtml(truncate(filesStr, 100)) + '</div>' : ''}
+                  \${isLong ? '<a href="#" onclick="toggleExpand(\\'' + sumId + '\\');return false;" style="color:var(--accent);font-size:12px;">show more</a>' : ''}
+                </span>
+                <span id="\${sumId}_full" style="display:none;">
+                  \${requestText ? '<div><strong>Request:</strong> ' + escapeHtml(requestText) + '</div>' : ''}
+                  \${completedText ? '<div><strong>Completed:</strong> ' + escapeHtml(completedText) + '</div>' : ''}
+                  \${filesStr ? '<div><strong>Files:</strong> ' + escapeHtml(filesStr) + '</div>' : ''}
+                  \${item.nextSteps ? '<div><strong>Next:</strong> ' + escapeHtml(item.nextSteps) + '</div>' : ''}
+                  \${item.notes ? '<div><strong>Notes:</strong> ' + escapeHtml(item.notes) + '</div>' : ''}
+                  <a href="#" onclick="toggleExpand(\\'' + sumId + '\\');return false;" style="color:var(--accent);font-size:12px;">show less</a>
+                </span>
               </div>
             </div>\`;
           }
@@ -2207,17 +2228,46 @@ function getHTML(): string {
           // observation
           const icons = { read: '📖', write: '✏️', execute: '⚡', search: '🔍' };
           const icon = icons[item.obsType] || '•';
-          const subtitle = item.subtitle ? ' - ' + escapeHtml(truncate(item.subtitle, 120)) : '';
+          const titleText = item.compressedSummary || item.title || '';
+          const subtitleText = item.subtitle ? escapeHtml(item.subtitle) : '';
+          const narrativeText = item.narrative ? escapeHtml(item.narrative) : '';
+          let intentBadges = '';
+          try {
+            const concepts = JSON.parse(item.concepts || '[]');
+            const intents = concepts.filter(c => c.startsWith('intent:')).map(c => c.slice(7));
+            if (intents.length > 0) intentBadges = ' <span style="font-size:11px;color:var(--warning);opacity:0.8;">[' + intents.join(', ') + ']</span>';
+          } catch {}
+          const hasDetails = subtitleText || narrativeText;
+          const obsId = 'obs_' + Math.random().toString(36).slice(2, 8);
           return \`<div class="entry-card" style="border-left:3px solid var(--border);padding:12px 16px;">
-            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
-              <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;">\${icon} <strong>\${escapeHtml(item.toolName || '')}</strong> \${escapeHtml(truncate(item.title, 100))}\${subtitle}\${scoreBadge}</span>
-              <span style="color:var(--text-muted);font-size:12px;">\${vecBadge} \${time}\${item.promptNumber ? ' · P#' + item.promptNumber : ''}</span>
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;\${hasDetails ? 'cursor:pointer;' : ''}" \${hasDetails ? 'onclick="toggleObsDetail(\\'' + obsId + '\\')"' : ''}>
+              <span style="flex:1;min-width:0;">\${icon} <strong>\${escapeHtml(item.toolName || '')}</strong> \${escapeHtml(titleText)}\${intentBadges}\${scoreBadge}</span>
+              <span style="color:var(--text-muted);font-size:12px;white-space:nowrap;">\${vecBadge} \${time}\${item.promptNumber ? ' · P#' + item.promptNumber : ''}\${item.isCompressed ? ' · <span style="color:var(--success);">Z</span>' : ''}</span>
             </div>
+            \${hasDetails ? '<div id="' + obsId + '" style="display:none;margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:13px;color:var(--text-secondary);">' +
+              (subtitleText ? '<div>' + subtitleText + '</div>' : '') +
+              (narrativeText ? '<div style="margin-top:4px;font-style:italic;">' + narrativeText + '</div>' : '') +
+            '</div>' : ''}
           </div>\`;
         }).join('');
 
       } catch (err) {
         feed.innerHTML = '<div style="text-align:center;color:var(--error);padding:40px;">Error loading sessions: ' + err.message + '</div>';
+      }
+    }
+
+    function toggleObsDetail(id) {
+      const el = document.getElementById(id);
+      if (el) el.style.display = el.style.display === 'none' ? '' : 'none';
+    }
+
+    function toggleExpand(id) {
+      const short = document.getElementById(id + '_short');
+      const full = document.getElementById(id + '_full');
+      if (short && full) {
+        const showFull = short.style.display !== 'none';
+        short.style.display = showFull ? 'none' : '';
+        full.style.display = showFull ? '' : 'none';
       }
     }
 
@@ -2738,6 +2788,119 @@ function handleRequest(
       } catch {
         res.writeHead(200);
         res.end(JSON.stringify([]));
+      }
+      return;
+    }
+
+    // ===== Hook API Endpoints =====
+
+    // GET /api/hook/sessions - List hook sessions
+    if (url.pathname === '/api/hook/sessions' && method === 'GET') {
+      const project = url.searchParams.get('project') || undefined;
+      const limit = parseInt(url.searchParams.get('limit') || '20', 10);
+      try {
+        let rows: Record<string, unknown>[];
+        if (project) {
+          rows = db.prepare(
+            'SELECT * FROM sessions WHERE project = ? ORDER BY started_at DESC LIMIT ?'
+          ).all(project, limit) as Record<string, unknown>[];
+        } else {
+          rows = db.prepare(
+            'SELECT * FROM sessions ORDER BY started_at DESC LIMIT ?'
+          ).all(limit) as Record<string, unknown>[];
+        }
+        res.writeHead(200);
+        res.end(JSON.stringify(rows));
+      } catch (error) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: String(error) }));
+      }
+      return;
+    }
+
+    // GET /api/hook/observations - List hook observations
+    if (url.pathname === '/api/hook/observations' && method === 'GET') {
+      const project = url.searchParams.get('project') || undefined;
+      const limit = parseInt(url.searchParams.get('limit') || '50', 10);
+      try {
+        let rows: Record<string, unknown>[];
+        if (project) {
+          rows = db.prepare(
+            'SELECT id, session_id, project, tool_name, timestamp, type, title, subtitle, narrative, facts, concepts, prompt_number, compressed_summary, is_compressed FROM observations WHERE project = ? ORDER BY timestamp DESC LIMIT ?'
+          ).all(project, limit) as Record<string, unknown>[];
+        } else {
+          rows = db.prepare(
+            'SELECT id, session_id, project, tool_name, timestamp, type, title, subtitle, narrative, facts, concepts, prompt_number, compressed_summary, is_compressed FROM observations ORDER BY timestamp DESC LIMIT ?'
+          ).all(limit) as Record<string, unknown>[];
+        }
+        res.writeHead(200);
+        res.end(JSON.stringify(rows));
+      } catch (error) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: String(error) }));
+      }
+      return;
+    }
+
+    // GET /api/hook/session/:id - Session detail with observations and prompts
+    if (url.pathname.startsWith('/api/hook/session/') && method === 'GET') {
+      const sessionId = url.pathname.slice('/api/hook/session/'.length);
+      try {
+        const session = db.prepare('SELECT * FROM sessions WHERE session_id = ?').get(sessionId);
+        if (!session) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: 'Session not found' }));
+          return;
+        }
+        const observations = db.prepare(
+          'SELECT id, tool_name, timestamp, type, title, subtitle, narrative, facts, concepts, prompt_number, compressed_summary, is_compressed FROM observations WHERE session_id = ? ORDER BY timestamp ASC'
+        ).all(sessionId);
+        const prompts = db.prepare(
+          'SELECT * FROM user_prompts WHERE session_id = ? ORDER BY prompt_number ASC'
+        ).all(sessionId);
+        const summary = db.prepare(
+          'SELECT * FROM session_summaries WHERE session_id = ? ORDER BY created_at DESC LIMIT 1'
+        ).get(sessionId);
+
+        res.writeHead(200);
+        res.end(JSON.stringify({ session, observations, prompts, summary }));
+      } catch (error) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: String(error) }));
+      }
+      return;
+    }
+
+    // GET /api/hook/queue/status - Task queue stats
+    if (url.pathname === '/api/hook/queue/status' && method === 'GET') {
+      try {
+        const stats = db.prepare(`
+          SELECT task_type, status, COUNT(*) as count
+          FROM task_queue
+          GROUP BY task_type, status
+        `).all();
+        const total = (db.prepare('SELECT COUNT(*) as c FROM task_queue').get() as { c: number }).c;
+        res.writeHead(200);
+        res.end(JSON.stringify({ total, breakdown: stats }));
+      } catch (error) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: String(error) }));
+      }
+      return;
+    }
+
+    // POST /api/hook/cleanup - Clean old completed/failed queue tasks
+    if (url.pathname === '/api/hook/cleanup' && method === 'POST') {
+      try {
+        const oneDayAgo = Date.now() - 86400000;
+        const result = db.prepare(
+          "DELETE FROM task_queue WHERE status IN ('completed', 'failed') OR (status = 'processing' AND created_at < ?)"
+        ).run(oneDayAgo);
+        res.writeHead(200);
+        res.end(JSON.stringify({ deleted: result.changes }));
+      } catch (error) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: String(error) }));
       }
       return;
     }

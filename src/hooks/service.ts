@@ -26,10 +26,19 @@ import {
   extractFilePaths,
   extractFacts,
   extractConcepts,
+  detectIntent,
+  extractIntents,
   truncate,
   computeContentHash,
   ContextConfig,
   DEFAULT_CONTEXT_CONFIG,
+  LifecycleConfig,
+  DEFAULT_LIFECYCLE_CONFIG,
+  LifecycleResult,
+  LifecycleStats,
+  ExportData,
+  ExportSession,
+  ImportResult,
 } from './types.js';
 import { enrichWithAI, enrichSummaryWithAI, compressObservationWithAI, generateSessionDigestWithAI } from './ai-enrichment.js';
 
@@ -220,6 +229,19 @@ export class MemoryHookService {
   }
 
   /**
+   * Get the latest prompt text for a session (for intent detection)
+   */
+  getLatestPromptText(sessionId: string): string | null {
+    if (!this.db) return null;
+
+    const row = this.db.prepare(
+      'SELECT prompt_text FROM user_prompts WHERE session_id = ? ORDER BY prompt_number DESC LIMIT 1'
+    ).get(sessionId) as { prompt_text: string } | undefined;
+
+    return row?.prompt_text || null;
+  }
+
+  /**
    * Get current prompt number for a session (0 if no prompts yet)
    */
   getPromptNumber(sessionId: string): number {
@@ -372,6 +394,13 @@ export class MemoryHookService {
     const narrative = generateObservationNarrative(toolName, toolInput, toolResponse);
     const facts = extractFacts(toolName, toolInput, toolResponse);
     const concepts = extractConcepts(toolName, toolInput, toolResponse);
+
+    // Detect developer intent and add as intent: prefixed tags
+    const latestPrompt = this.getLatestPromptText(sessionId);
+    const intents = detectIntent(toolName, toolInput, toolResponse, latestPrompt || undefined);
+    for (const intent of intents) {
+      concepts.push(`intent:${intent}`);
+    }
 
     this.db!.prepare(`
       INSERT INTO observations (id, session_id, project, tool_name, tool_input, tool_response, cwd, timestamp, type, title, prompt_number, files_read, files_modified, subtitle, narrative, facts, concepts, content_hash)
@@ -1012,7 +1041,8 @@ export class MemoryHookService {
           for (const obs of obsGroup) {
             const icon = this.getObservationIcon(obs.type);
             const detail = obs.compressedSummary || obs.subtitle || obs.title || obs.toolName;
-            lines.push(`- ${icon} **${detail}** [${obs.id}]`);
+            const intentBadge = this.formatIntentBadge(obs.concepts || []);
+            lines.push(`- ${icon} **${detail}**${intentBadge} [${obs.id}]`);
           }
           lines.push('');
         }
@@ -1025,7 +1055,8 @@ export class MemoryHookService {
           const time = this.formatRelativeTime(obs.timestamp);
           const icon = this.getObservationIcon(obs.type);
           const detail = obs.compressedSummary || obs.subtitle || obs.title || obs.toolName;
-          lines.push(`- ${icon} **${detail}** (${time}) [${obs.id}]`);
+          const intentBadge = this.formatIntentBadge(obs.concepts || []);
+          lines.push(`- ${icon} **${detail}**${intentBadge} (${time}) [${obs.id}]`);
           if (obs.narrative) {
             lines.push(`  ${obs.narrative}`);
           }
@@ -1278,6 +1309,313 @@ export class MemoryHookService {
     };
   }
 
+  // ===== Lifecycle Management =====
+
+  /**
+   * Run lifecycle tasks: compress old observations, archive old sessions,
+   * optionally delete archived sessions, and vacuum.
+   */
+  async runLifecycleTasks(config: Partial<LifecycleConfig> = {}): Promise<LifecycleResult> {
+    await this.ensureInitialized();
+
+    const cfg = { ...DEFAULT_LIFECYCLE_CONFIG, ...config };
+    const now = Date.now();
+    let compressed = 0;
+    let archived = 0;
+    let deleted = 0;
+    let vacuumed = false;
+
+    // 1. Compress old uncompressed observations
+    if (cfg.autoCompress) {
+      const cutoff = now - cfg.compressAfterDays * 86400000;
+      const rows = this.db!.prepare(
+        'SELECT id FROM observations WHERE is_compressed = 0 AND timestamp < ? LIMIT 100'
+      ).all(cutoff) as { id: string }[];
+
+      for (const row of rows) {
+        this.queueTask('compress', 'observations', row.id);
+        compressed++;
+      }
+    }
+
+    // 2. Archive old completed sessions
+    if (cfg.autoArchive) {
+      const cutoff = now - cfg.archiveAfterDays * 86400000;
+      const result = this.db!.prepare(
+        "UPDATE sessions SET status = 'archived' WHERE status = 'completed' AND ended_at IS NOT NULL AND ended_at < ?"
+      ).run(cutoff);
+      archived = result.changes;
+    }
+
+    // 3. Delete archived sessions (opt-in)
+    if (cfg.autoDelete) {
+      const cutoff = now - cfg.deleteAfterDays * 86400000;
+      const sessions = this.db!.prepare(
+        "SELECT session_id FROM sessions WHERE status = 'archived' AND ended_at IS NOT NULL AND ended_at < ?"
+      ).all(cutoff) as { session_id: string }[];
+
+      if (sessions.length > 0) {
+        const deleteTransaction = this.db!.transaction(() => {
+          for (const s of sessions) {
+            this.db!.prepare('DELETE FROM observations WHERE session_id = ?').run(s.session_id);
+            this.db!.prepare('DELETE FROM user_prompts WHERE session_id = ?').run(s.session_id);
+            this.db!.prepare('DELETE FROM session_summaries WHERE session_id = ?').run(s.session_id);
+            this.db!.prepare('DELETE FROM session_digests WHERE session_id = ?').run(s.session_id);
+            this.db!.prepare('DELETE FROM sessions WHERE session_id = ?').run(s.session_id);
+          }
+        });
+        deleteTransaction();
+        deleted = sessions.length;
+
+        // 4. Vacuum if deletes occurred
+        if (cfg.autoVacuum && deleted > 0) {
+          this.db!.exec('VACUUM');
+          vacuumed = true;
+        }
+      }
+    }
+
+    return { compressed, archived, deleted, vacuumed };
+  }
+
+  /**
+   * Get lifecycle statistics for the database
+   */
+  async getLifecycleStats(): Promise<LifecycleStats> {
+    await this.ensureInitialized();
+
+    const sessionStats = this.db!.prepare(`
+      SELECT
+        COUNT(*) as total,
+        SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) as active,
+        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+        SUM(CASE WHEN status = 'archived' THEN 1 ELSE 0 END) as archived
+      FROM sessions
+    `).get() as { total: number; active: number; completed: number; archived: number };
+
+    const obsStats = this.db!.prepare(`
+      SELECT
+        COUNT(*) as total,
+        SUM(CASE WHEN is_compressed = 1 THEN 1 ELSE 0 END) as compressed,
+        SUM(CASE WHEN is_compressed = 0 THEN 1 ELSE 0 END) as uncompressed
+      FROM observations
+    `).get() as { total: number; compressed: number; uncompressed: number };
+
+    const promptStats = this.db!.prepare(
+      'SELECT COUNT(*) as total FROM user_prompts'
+    ).get() as { total: number };
+
+    // Get DB file size
+    let dbSizeBytes = 0;
+    try {
+      const { statSync } = await import('node:fs');
+      const stat = statSync(this.dbPath);
+      dbSizeBytes = stat.size;
+    } catch { /* ignore */ }
+
+    return {
+      totalSessions: sessionStats.total || 0,
+      activeSessions: sessionStats.active || 0,
+      completedSessions: sessionStats.completed || 0,
+      archivedSessions: sessionStats.archived || 0,
+      totalObservations: obsStats.total || 0,
+      compressedObservations: obsStats.compressed || 0,
+      uncompressedObservations: obsStats.uncompressed || 0,
+      totalPrompts: promptStats.total || 0,
+      dbSizeBytes,
+    };
+  }
+
+  // ===== Export/Import =====
+
+  /**
+   * Export sessions and related data to JSON format
+   */
+  async exportToJSON(project: string, sessionIds?: string[]): Promise<ExportData> {
+    await this.ensureInitialized();
+
+    let sessions: Record<string, unknown>[];
+    if (sessionIds && sessionIds.length > 0) {
+      const placeholders = sessionIds.map(() => '?').join(',');
+      sessions = this.db!.prepare(
+        `SELECT * FROM sessions WHERE session_id IN (${placeholders})`
+      ).all(...sessionIds) as Record<string, unknown>[];
+    } else {
+      sessions = this.db!.prepare(
+        'SELECT * FROM sessions WHERE project = ? ORDER BY started_at DESC'
+      ).all(project) as Record<string, unknown>[];
+    }
+
+    const exportSessions: ExportSession[] = [];
+
+    for (const session of sessions) {
+      const sid = session.session_id as string;
+
+      const observations = this.db!.prepare(
+        'SELECT * FROM observations WHERE session_id = ? ORDER BY timestamp ASC'
+      ).all(sid) as Record<string, unknown>[];
+
+      const prompts = this.db!.prepare(
+        'SELECT * FROM user_prompts WHERE session_id = ? ORDER BY prompt_number ASC'
+      ).all(sid) as Record<string, unknown>[];
+
+      const summary = this.db!.prepare(
+        'SELECT * FROM session_summaries WHERE session_id = ? ORDER BY created_at DESC LIMIT 1'
+      ).get(sid) as Record<string, unknown> | undefined;
+
+      exportSessions.push({
+        sessionId: sid,
+        project: session.project as string,
+        prompt: session.prompt as string,
+        startedAt: session.started_at as number,
+        endedAt: (session.ended_at as number) || undefined,
+        status: session.status as string,
+        parentSessionId: (session.parent_session_id as string) || undefined,
+        observations: observations.map(o => ({
+          id: o.id as string,
+          toolName: o.tool_name as string,
+          timestamp: o.timestamp as number,
+          type: o.type as string,
+          title: o.title as string | undefined,
+          subtitle: o.subtitle as string | undefined,
+          narrative: o.narrative as string | undefined,
+          facts: JSON.parse((o.facts as string) || '[]'),
+          concepts: JSON.parse((o.concepts as string) || '[]'),
+          contentHash: o.content_hash as string | undefined,
+          compressedSummary: o.compressed_summary as string | undefined,
+          isCompressed: (o.is_compressed as number) === 1,
+        })),
+        prompts: prompts.map(p => ({
+          promptNumber: p.prompt_number as number,
+          promptText: p.prompt_text as string,
+          createdAt: p.created_at as number,
+          contentHash: p.content_hash as string | undefined,
+        })),
+        summary: summary ? {
+          request: summary.request as string,
+          completed: summary.completed as string,
+          filesRead: JSON.parse((summary.files_read as string) || '[]'),
+          filesModified: JSON.parse((summary.files_modified as string) || '[]'),
+          nextSteps: summary.next_steps as string,
+          notes: summary.notes as string,
+        } : undefined,
+      });
+    }
+
+    return {
+      version: '1.0',
+      exportedAt: Date.now(),
+      project,
+      sessions: exportSessions,
+    };
+  }
+
+  /**
+   * Import sessions and related data from JSON format.
+   * Generates new session IDs prefixed with 'imported_' to avoid conflicts.
+   * Deduplicates observations and prompts via content_hash.
+   */
+  async importFromJSON(data: ExportData): Promise<ImportResult> {
+    await this.ensureInitialized();
+
+    let importedSessions = 0;
+    let importedObservations = 0;
+    let importedPrompts = 0;
+    let skippedObservations = 0;
+    let skippedPrompts = 0;
+
+    const importTransaction = this.db!.transaction(() => {
+      for (const session of data.sessions) {
+        const newSessionId = `imported_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+
+        // Insert session
+        this.db!.prepare(`
+          INSERT INTO sessions (session_id, project, prompt, started_at, ended_at, observation_count, status, parent_session_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          newSessionId, session.project, session.prompt,
+          session.startedAt, session.endedAt || null,
+          session.observations.length, session.status || 'completed',
+          session.parentSessionId || null
+        );
+        importedSessions++;
+
+        // Import observations (dedup by content_hash)
+        for (const obs of session.observations) {
+          if (obs.contentHash) {
+            const existing = this.db!.prepare(
+              'SELECT id FROM observations WHERE content_hash = ? LIMIT 1'
+            ).get(obs.contentHash) as { id: string } | undefined;
+            if (existing) {
+              skippedObservations++;
+              continue;
+            }
+          }
+
+          const newObsId = generateObservationId();
+          this.db!.prepare(`
+            INSERT INTO observations (id, session_id, project, tool_name, tool_input, tool_response, cwd, timestamp, type, title, subtitle, narrative, facts, concepts, content_hash, compressed_summary, is_compressed)
+            VALUES (?, ?, ?, ?, '{}', '{}', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            newObsId, newSessionId, session.project, obs.toolName,
+            obs.timestamp, obs.type, obs.title || null, obs.subtitle || null,
+            obs.narrative || null, JSON.stringify(obs.facts || []),
+            JSON.stringify(obs.concepts || []), obs.contentHash || null,
+            obs.compressedSummary || null, obs.isCompressed ? 1 : 0
+          );
+          importedObservations++;
+
+          // Queue embedding
+          this.queueTask('embed', 'observations', newObsId);
+        }
+
+        // Import prompts (dedup by content_hash)
+        for (const prompt of session.prompts) {
+          if (prompt.contentHash) {
+            const fiveMinWindow = prompt.createdAt + 5 * 60 * 1000;
+            const existing = this.db!.prepare(
+              'SELECT id FROM user_prompts WHERE content_hash = ? AND created_at < ? LIMIT 1'
+            ).get(prompt.contentHash, fiveMinWindow) as { id: number } | undefined;
+            if (existing) {
+              skippedPrompts++;
+              continue;
+            }
+          }
+
+          const result = this.db!.prepare(`
+            INSERT INTO user_prompts (session_id, prompt_number, prompt_text, content_hash, created_at)
+            VALUES (?, ?, ?, ?, ?)
+          `).run(newSessionId, prompt.promptNumber, prompt.promptText, prompt.contentHash || null, prompt.createdAt);
+          importedPrompts++;
+
+          if (result.changes > 0) {
+            this.queueTask('embed', 'user_prompts', Number(result.lastInsertRowid));
+          }
+        }
+
+        // Import summary
+        if (session.summary) {
+          const s = session.summary;
+          this.db!.prepare(`
+            INSERT INTO session_summaries (session_id, project, request, completed, files_read, files_modified, next_steps, notes, prompt_number, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            newSessionId, session.project, s.request, s.completed,
+            JSON.stringify(s.filesRead || []), JSON.stringify(s.filesModified || []),
+            s.nextSteps || '', s.notes || '', session.prompts.length, Date.now()
+          );
+        }
+      }
+    });
+
+    importTransaction();
+
+    return {
+      imported: { sessions: importedSessions, observations: importedObservations, prompts: importedPrompts },
+      skipped: { observations: skippedObservations, prompts: skippedPrompts },
+    };
+  }
+
   // ===== Private Methods =====
 
   private async ensureInitialized(): Promise<void> {
@@ -1521,6 +1859,12 @@ export class MemoryHookService {
     if (days < 7) return `${days}d ago`;
 
     return new Date(timestamp).toLocaleDateString();
+  }
+
+  private formatIntentBadge(concepts: string[]): string {
+    const intents = extractIntents(concepts);
+    if (intents.length === 0) return '';
+    return ` [${intents.join(', ')}]`;
   }
 
   private getObservationIcon(type: string): string {

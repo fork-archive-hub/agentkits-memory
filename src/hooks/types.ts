@@ -208,6 +208,131 @@ export type ObservationType =
   | 'other';    // Unknown tools
 
 /**
+ * Observation intent — what the developer is trying to accomplish.
+ * Stored as `intent:<type>` prefixed tags in the concepts array (no schema change).
+ */
+export type ObservationIntent =
+  | 'bugfix'
+  | 'feature'
+  | 'refactor'
+  | 'investigation'
+  | 'testing'
+  | 'documentation'
+  | 'configuration'
+  | 'optimization';
+
+/**
+ * Detect the developer's intent from tool usage context.
+ * Pattern-matches on prompt text, tool name, and tool input.
+ * Returns one or more intents (usually 1-2).
+ */
+export function detectIntent(
+  toolName: string,
+  toolInput: unknown,
+  _toolResponse: unknown,
+  prompt?: string
+): ObservationIntent[] {
+  const intents: Set<ObservationIntent> = new Set();
+
+  // Pattern-match on latest prompt text (strongest signal)
+  if (prompt) {
+    const p = prompt.toLowerCase();
+
+    // Bugfix signals
+    if (/\b(fix|bug|broken|crash|error|issue|wrong|fail|regress|patch|hotfix)\b/.test(p)) {
+      intents.add('bugfix');
+    }
+    // Feature signals
+    if (/\b(add|create|implement|new|feature|build|introduce|enable)\b/.test(p)) {
+      intents.add('feature');
+    }
+    // Refactor signals
+    if (/\b(refactor|rename|restructure|reorganize|clean\s*up|simplify|extract|move|split|merge|dedup)\b/.test(p)) {
+      intents.add('refactor');
+    }
+    // Testing signals
+    if (/\b(test|spec|coverage|assert|expect|mock|stub|vitest|jest|pytest)\b/.test(p)) {
+      intents.add('testing');
+    }
+    // Documentation signals
+    if (/\b(doc|readme|comment|jsdoc|typedoc|changelog|annotation)\b/.test(p)) {
+      intents.add('documentation');
+    }
+    // Configuration signals
+    if (/\b(config|setting|env|environment|setup|install|dependency|package|deploy)\b/.test(p)) {
+      intents.add('configuration');
+    }
+    // Optimization signals
+    if (/\b(optimiz\w*|perf\w*|speed|slow|fast\w*|cach\w*|lazy|memory\s*leak|bundl\w*|minif\w*|compress\w*)\b/.test(p)) {
+      intents.add('optimization');
+    }
+  }
+
+  // Pattern-match on tool name (secondary signal)
+  const readTools = ['Read', 'Glob', 'Grep', 'LS'];
+  const writeTools = ['Write', 'Edit', 'MultiEdit'];
+  const searchTools = ['WebSearch', 'WebFetch'];
+
+  if (readTools.includes(toolName) || searchTools.includes(toolName)) {
+    // Reading/searching without other intent → investigation
+    if (intents.size === 0) {
+      intents.add('investigation');
+    }
+  }
+
+  // Pattern-match on tool input (tertiary signal)
+  try {
+    const input = typeof toolInput === 'string' ? JSON.parse(toolInput) : toolInput;
+
+    if (toolName === 'Bash') {
+      const cmd = ((input?.command as string) || '').toLowerCase();
+      if (/\b(test|vitest|jest|pytest|mocha|tap)\b/.test(cmd)) {
+        intents.add('testing');
+      }
+      if (/\b(build|tsc|webpack|vite|esbuild|rollup)\b/.test(cmd)) {
+        if (intents.size === 0) intents.add('feature');
+      }
+      if (/\b(lint|eslint|prettier|format)\b/.test(cmd)) {
+        intents.add('refactor');
+      }
+    }
+
+    // File path hints
+    const filePath = ((input?.file_path || input?.path || '') as string).toLowerCase();
+    if (filePath) {
+      if (/\.(test|spec)\.(ts|js|tsx|jsx)$/.test(filePath) || filePath.includes('__tests__')) {
+        intents.add('testing');
+      }
+      if (/readme|changelog|\.md$/.test(filePath) && writeTools.includes(toolName)) {
+        intents.add('documentation');
+      }
+      if (/config|\.env|tsconfig|package\.json|\.eslintrc/.test(filePath) && writeTools.includes(toolName)) {
+        intents.add('configuration');
+      }
+    }
+  } catch {
+    // Ignore parse errors
+  }
+
+  // Fallback: if no intent detected, default to investigation
+  if (intents.size === 0) {
+    intents.add('investigation');
+  }
+
+  return Array.from(intents);
+}
+
+/**
+ * Extract intent tags from a concepts array.
+ * Filters concepts starting with 'intent:' and strips the prefix.
+ */
+export function extractIntents(concepts: string[]): ObservationIntent[] {
+  return concepts
+    .filter(c => c.startsWith('intent:'))
+    .map(c => c.slice(7) as ObservationIntent);
+}
+
+/**
  * Session record for tracking
  */
 export interface SessionRecord {
@@ -331,6 +456,82 @@ export interface MemoryContext {
   markdown: string;
 }
 
+// ===== Export/Import Types =====
+
+/**
+ * Export data format
+ */
+export interface ExportData {
+  version: string;
+  exportedAt: number;
+  project: string;
+  sessions: ExportSession[];
+}
+
+/**
+ * Exported session with all related data
+ */
+export interface ExportSession {
+  sessionId: string;
+  project: string;
+  prompt: string;
+  startedAt: number;
+  endedAt?: number;
+  status: string;
+  parentSessionId?: string;
+  observations: ExportObservation[];
+  prompts: ExportPrompt[];
+  summary?: ExportSummary;
+}
+
+/**
+ * Exported observation
+ */
+export interface ExportObservation {
+  id: string;
+  toolName: string;
+  timestamp: number;
+  type: string;
+  title?: string;
+  subtitle?: string;
+  narrative?: string;
+  facts: string[];
+  concepts: string[];
+  contentHash?: string;
+  compressedSummary?: string;
+  isCompressed: boolean;
+}
+
+/**
+ * Exported user prompt
+ */
+export interface ExportPrompt {
+  promptNumber: number;
+  promptText: string;
+  createdAt: number;
+  contentHash?: string;
+}
+
+/**
+ * Exported session summary
+ */
+export interface ExportSummary {
+  request: string;
+  completed: string;
+  filesRead: string[];
+  filesModified: string[];
+  nextSteps: string;
+  notes: string;
+}
+
+/**
+ * Import result
+ */
+export interface ImportResult {
+  imported: { sessions: number; observations: number; prompts: number };
+  skipped: { observations: number; prompts: number };
+}
+
 // ===== Utility Functions =====
 
 /**
@@ -344,6 +545,62 @@ export interface ContextConfig {
   maxSummaries: number;
   maxPrompts: number;
   maxObservations: number;
+}
+
+/**
+ * Lifecycle configuration for memory decay/archival
+ */
+export interface LifecycleConfig {
+  /** Auto-compress old observations */
+  autoCompress: boolean;
+  /** Days after which to compress observations */
+  compressAfterDays: number;
+  /** Auto-archive old sessions */
+  autoArchive: boolean;
+  /** Days after which to archive sessions */
+  archiveAfterDays: number;
+  /** Auto-delete archived sessions (opt-in, disabled by default) */
+  autoDelete: boolean;
+  /** Days after which to delete archived sessions */
+  deleteAfterDays: number;
+  /** Auto-vacuum after deletes */
+  autoVacuum: boolean;
+}
+
+/** Default lifecycle configuration */
+export const DEFAULT_LIFECYCLE_CONFIG: LifecycleConfig = {
+  autoCompress: true,
+  compressAfterDays: 7,
+  autoArchive: true,
+  archiveAfterDays: 30,
+  autoDelete: false, // opt-in: destructive
+  deleteAfterDays: 90,
+  autoVacuum: true,
+};
+
+/**
+ * Lifecycle task results
+ */
+export interface LifecycleResult {
+  compressed: number;
+  archived: number;
+  deleted: number;
+  vacuumed: boolean;
+}
+
+/**
+ * Lifecycle statistics
+ */
+export interface LifecycleStats {
+  totalSessions: number;
+  activeSessions: number;
+  completedSessions: number;
+  archivedSessions: number;
+  totalObservations: number;
+  compressedObservations: number;
+  uncompressedObservations: number;
+  totalPrompts: number;
+  dbSizeBytes: number;
 }
 
 /** Default context configuration */

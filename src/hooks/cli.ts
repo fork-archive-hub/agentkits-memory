@@ -72,7 +72,7 @@ async function main(): Promise<void> {
 
     if (!event) {
       console.error('Usage: agentkits-memory-hook <event>');
-      console.error('Events: context, session-init, observation, summarize, user-message, enrich, enrich-summary, embed-session, enrich-session, compress-session');
+      console.error('Events: context, session-init, observation, summarize, user-message, enrich, enrich-summary, embed-session, enrich-session, compress-session, lifecycle, lifecycle-stats, export, import');
       process.exit(1);
     }
 
@@ -153,6 +153,88 @@ async function main(): Promise<void> {
       process.on('SIGINT', cleanup);
       try {
         await svc.processCompressionQueue();
+      } finally {
+        await svc.shutdown();
+      }
+      process.exit(0);
+    }
+
+    // Handle 'lifecycle' command (no stdin, runs lifecycle tasks)
+    // Usage: lifecycle <cwd> [--compress-days=7] [--archive-days=30] [--delete] [--delete-days=90]
+    if (event === 'lifecycle') {
+      const cwdArg = process.argv[3] || process.cwd();
+      const svc = new MemoryHookService(cwdArg);
+      await svc.initialize();
+      try {
+        const config: Record<string, unknown> = {};
+        for (const arg of process.argv.slice(4)) {
+          if (arg.startsWith('--compress-days=')) config.compressAfterDays = parseInt(arg.split('=')[1], 10);
+          if (arg.startsWith('--archive-days=')) config.archiveAfterDays = parseInt(arg.split('=')[1], 10);
+          if (arg === '--delete') config.autoDelete = true;
+          if (arg.startsWith('--delete-days=')) { config.deleteAfterDays = parseInt(arg.split('=')[1], 10); config.autoDelete = true; }
+        }
+        const result = await svc.runLifecycleTasks(config);
+        console.log(JSON.stringify(result, null, 2));
+      } finally {
+        await svc.shutdown();
+      }
+      process.exit(0);
+    }
+
+    // Handle 'lifecycle-stats' command
+    // Usage: lifecycle-stats <cwd>
+    if (event === 'lifecycle-stats') {
+      const cwdArg = process.argv[3] || process.cwd();
+      const svc = new MemoryHookService(cwdArg);
+      await svc.initialize();
+      try {
+        const stats = await svc.getLifecycleStats();
+        console.log(JSON.stringify(stats, null, 2));
+      } finally {
+        await svc.shutdown();
+      }
+      process.exit(0);
+    }
+
+    // Handle 'export' command
+    // Usage: export <cwd> <project> <outputPath>
+    if (event === 'export') {
+      const cwdArg = process.argv[3] || process.cwd();
+      const project = process.argv[4];
+      const outputPath = process.argv[5];
+      if (!project || !outputPath) {
+        console.error('Usage: export <cwd> <project> <outputPath>');
+        process.exit(1);
+      }
+      const svc = new MemoryHookService(cwdArg);
+      await svc.initialize();
+      try {
+        const data = await svc.exportToJSON(project);
+        const { writeFileSync } = await import('node:fs');
+        writeFileSync(outputPath, JSON.stringify(data, null, 2));
+        console.error(`Exported ${data.sessions.length} sessions to ${outputPath}`);
+      } finally {
+        await svc.shutdown();
+      }
+      process.exit(0);
+    }
+
+    // Handle 'import' command
+    // Usage: import <cwd> <inputPath>
+    if (event === 'import') {
+      const cwdArg = process.argv[3] || process.cwd();
+      const inputPath = process.argv[4];
+      if (!inputPath) {
+        console.error('Usage: import <cwd> <inputPath>');
+        process.exit(1);
+      }
+      const svc = new MemoryHookService(cwdArg);
+      await svc.initialize();
+      try {
+        const { readFileSync } = await import('node:fs');
+        const data = JSON.parse(readFileSync(inputPath, 'utf-8'));
+        const result = await svc.importFromJSON(data);
+        console.log(JSON.stringify(result, null, 2));
       } finally {
         await svc.shutdown();
       }

@@ -941,4 +941,256 @@ describe('MemoryHookService', () => {
       expect(svc).toBeInstanceOf(MemoryHookService);
     });
   });
+
+  // ===== Feature #5: Intent Tags =====
+
+  describe('intent detection in storeObservation', () => {
+    it('should add intent tags to concepts when prompt exists', async () => {
+      await service.initialize();
+      await service.initSession('intent-session', 'test-project', 'Fix the login bug');
+      await service.saveUserPrompt('intent-session', 'test-project', 'Fix the login bug');
+
+      const obs = await service.storeObservation(
+        'intent-session', 'test-project', 'Edit',
+        { file_path: 'src/auth.ts', old_string: 'foo', new_string: 'bar' },
+        { success: true }, TEST_DIR
+      );
+
+      expect(obs.concepts).toBeDefined();
+      const intentConcepts = obs.concepts!.filter(c => c.startsWith('intent:'));
+      expect(intentConcepts.length).toBeGreaterThan(0);
+      expect(intentConcepts).toContain('intent:bugfix');
+    });
+
+    it('should default to investigation for read without prompt', async () => {
+      await service.initialize();
+      await service.initSession('intent-session-2', 'test-project');
+
+      const obs = await service.storeObservation(
+        'intent-session-2', 'test-project', 'Read',
+        { file_path: 'src/app.ts' },
+        { content: 'file contents' }, TEST_DIR
+      );
+
+      const intentConcepts = obs.concepts!.filter(c => c.startsWith('intent:'));
+      expect(intentConcepts).toContain('intent:investigation');
+    });
+  });
+
+  describe('getLatestPromptText', () => {
+    it('should return latest prompt text', async () => {
+      await service.initialize();
+      await service.initSession('prompt-text-session', 'test-project', 'Hello');
+      await service.saveUserPrompt('prompt-text-session', 'test-project', 'First prompt');
+      await service.saveUserPrompt('prompt-text-session', 'test-project', 'Second prompt');
+
+      const text = service.getLatestPromptText('prompt-text-session');
+      expect(text).toBe('Second prompt');
+    });
+
+    it('should return null when no prompts exist', async () => {
+      await service.initialize();
+      const text = service.getLatestPromptText('nonexistent-session');
+      expect(text).toBeNull();
+    });
+  });
+
+  // ===== Feature #8: Lifecycle Management =====
+
+  describe('lifecycle management', () => {
+    it('should archive old completed sessions', async () => {
+      await service.initialize();
+
+      // Create an old completed session
+      await service.initSession('old-session', 'test-project', 'old task');
+      await service.completeSession('old-session', 'Done');
+
+      // Manually backdate the session
+      // @ts-expect-error accessing private db for testing
+      service.db.prepare("UPDATE sessions SET ended_at = ? WHERE session_id = ?").run(
+        Date.now() - 40 * 86400000, // 40 days ago
+        'old-session'
+      );
+
+      const result = await service.runLifecycleTasks({ archiveAfterDays: 30 });
+      expect(result.archived).toBe(1);
+
+      // Verify session is archived
+      const session = service.getSession('old-session');
+      expect(session?.status).toBe('archived');
+    });
+
+    it('should not archive recent sessions', async () => {
+      await service.initialize();
+
+      await service.initSession('recent-session', 'test-project', 'recent task');
+      await service.completeSession('recent-session', 'Done');
+
+      const result = await service.runLifecycleTasks({ archiveAfterDays: 30 });
+      expect(result.archived).toBe(0);
+
+      const session = service.getSession('recent-session');
+      expect(session?.status).toBe('completed');
+    });
+
+    it('should delete archived sessions when autoDelete enabled', async () => {
+      await service.initialize();
+
+      await service.initSession('delete-session', 'test-project', 'delete task');
+      await service.completeSession('delete-session', 'Done');
+
+      // @ts-expect-error accessing private db for testing
+      service.db.prepare("UPDATE sessions SET status = 'archived', ended_at = ? WHERE session_id = ?").run(
+        Date.now() - 100 * 86400000, // 100 days ago
+        'delete-session'
+      );
+
+      const result = await service.runLifecycleTasks({
+        autoDelete: true,
+        deleteAfterDays: 90,
+      });
+      expect(result.deleted).toBe(1);
+      expect(result.vacuumed).toBe(true);
+
+      const session = service.getSession('delete-session');
+      expect(session).toBeNull();
+    });
+
+    it('should not delete when autoDelete is false (default)', async () => {
+      await service.initialize();
+
+      await service.initSession('keep-session', 'test-project', 'keep task');
+      await service.completeSession('keep-session', 'Done');
+
+      // @ts-expect-error accessing private db for testing
+      service.db.prepare("UPDATE sessions SET status = 'archived', ended_at = ? WHERE session_id = ?").run(
+        Date.now() - 100 * 86400000,
+        'keep-session'
+      );
+
+      const result = await service.runLifecycleTasks({ autoDelete: false });
+      expect(result.deleted).toBe(0);
+
+      const session = service.getSession('keep-session');
+      expect(session).not.toBeNull();
+    });
+
+    it('should queue compression for old uncompressed observations', async () => {
+      await service.initialize();
+      await service.initSession('compress-lc-session', 'test-project', 'task');
+
+      await service.storeObservation(
+        'compress-lc-session', 'test-project', 'Read',
+        { file_path: 'file.ts' }, { content: 'data' }, TEST_DIR
+      );
+
+      // Backdate the observation
+      // @ts-expect-error accessing private db for testing
+      service.db.prepare("UPDATE observations SET timestamp = ? WHERE session_id = ?").run(
+        Date.now() - 10 * 86400000, // 10 days ago
+        'compress-lc-session'
+      );
+
+      const result = await service.runLifecycleTasks({ compressAfterDays: 7 });
+      expect(result.compressed).toBe(1);
+    });
+  });
+
+  describe('lifecycle stats', () => {
+    it('should return database statistics', async () => {
+      await service.initialize();
+
+      await service.initSession('stats-session', 'test-project', 'stats');
+      await service.storeObservation(
+        'stats-session', 'test-project', 'Read',
+        { file_path: 'file.ts' }, { content: 'data' }, TEST_DIR
+      );
+      await service.saveUserPrompt('stats-session', 'test-project', 'test prompt');
+
+      const stats = await service.getLifecycleStats();
+      expect(stats.totalSessions).toBeGreaterThanOrEqual(1);
+      expect(stats.activeSessions).toBeGreaterThanOrEqual(1);
+      expect(stats.totalObservations).toBeGreaterThanOrEqual(1);
+      expect(stats.totalPrompts).toBeGreaterThanOrEqual(1);
+      expect(stats.dbSizeBytes).toBeGreaterThan(0);
+    });
+  });
+
+  // ===== Feature #9: Export/Import =====
+
+  describe('export/import', () => {
+    it('should export sessions with observations and prompts', async () => {
+      await service.initialize();
+      await service.initSession('export-session', 'test-project', 'export task');
+      await service.saveUserPrompt('export-session', 'test-project', 'export prompt');
+      await service.storeObservation(
+        'export-session', 'test-project', 'Read',
+        { file_path: 'file.ts' }, { content: 'data' }, TEST_DIR
+      );
+      await service.completeSession('export-session', 'Done');
+
+      const data = await service.exportToJSON('test-project');
+      expect(data.version).toBe('1.0');
+      expect(data.project).toBe('test-project');
+      expect(data.sessions.length).toBeGreaterThanOrEqual(1);
+
+      const session = data.sessions.find(s => s.sessionId === 'export-session');
+      expect(session).toBeDefined();
+      expect(session!.observations.length).toBeGreaterThanOrEqual(1);
+      expect(session!.prompts.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('should export specific sessions by ID', async () => {
+      await service.initialize();
+      await service.initSession('export-a', 'test-project', 'task A');
+      await service.initSession('export-b', 'test-project', 'task B');
+
+      const data = await service.exportToJSON('test-project', ['export-a']);
+      expect(data.sessions.length).toBe(1);
+      expect(data.sessions[0].sessionId).toBe('export-a');
+    });
+
+    it('should import exported data with new session IDs', async () => {
+      await service.initialize();
+      await service.initSession('import-src', 'test-project', 'import task');
+      await service.saveUserPrompt('import-src', 'test-project', 'import prompt');
+      await service.storeObservation(
+        'import-src', 'test-project', 'Read',
+        { file_path: 'file.ts' }, { content: 'data' }, TEST_DIR
+      );
+
+      const exported = await service.exportToJSON('test-project', ['import-src']);
+
+      // Importing into same DB: content_hash dedup will skip existing obs/prompts
+      // but session is always created new
+      const result = await service.importFromJSON(exported);
+
+      expect(result.imported.sessions).toBe(1);
+      // Observations and prompts are deduplicated by content_hash since they already exist
+      expect(result.imported.observations + result.skipped.observations).toBeGreaterThanOrEqual(1);
+      expect(result.imported.prompts + result.skipped.prompts).toBeGreaterThanOrEqual(1);
+    });
+
+    it('should dedup observations by content_hash on reimport', async () => {
+      await service.initialize();
+      await service.initSession('dedup-session', 'test-project', 'dedup task');
+      await service.storeObservation(
+        'dedup-session', 'test-project', 'Read',
+        { file_path: 'file.ts' }, { content: 'data' }, TEST_DIR
+      );
+
+      const exported = await service.exportToJSON('test-project', ['dedup-session']);
+
+      // First import: content_hash already exists in same DB → skipped
+      const result1 = await service.importFromJSON(exported);
+      // Second import: still skipped (same hash)
+      const result2 = await service.importFromJSON(exported);
+
+      // Both imports should have the session created but obs deduplicated
+      expect(result1.imported.sessions).toBe(1);
+      expect(result2.imported.sessions).toBe(1);
+      // Both skip observations since content_hash already in DB
+      expect(result1.skipped.observations + result2.skipped.observations).toBeGreaterThanOrEqual(1);
+    });
+  });
 });

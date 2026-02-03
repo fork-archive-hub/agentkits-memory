@@ -15,6 +15,8 @@ import {
   extractFilePaths,
   extractFacts,
   extractConcepts,
+  detectIntent,
+  extractIntents,
   truncate,
   parseHookInput,
   formatResponse,
@@ -649,6 +651,96 @@ describe('Hook Types Utilities', () => {
     it('should handle null inputs', () => {
       const concepts = extractConcepts('Read', null);
       expect(concepts).toEqual([]);
+    });
+  });
+
+  describe('detectIntent', () => {
+    it('should detect bugfix intent from prompt', () => {
+      const intents = detectIntent('Edit', { file_path: 'src/app.ts' }, {}, 'Fix the login bug');
+      expect(intents).toContain('bugfix');
+    });
+
+    it('should detect feature intent from prompt', () => {
+      const intents = detectIntent('Write', { file_path: 'src/new.ts' }, {}, 'Add a new payment feature');
+      expect(intents).toContain('feature');
+    });
+
+    it('should detect refactor intent from prompt', () => {
+      const intents = detectIntent('Edit', { file_path: 'src/app.ts' }, {}, 'Refactor the auth module');
+      expect(intents).toContain('refactor');
+    });
+
+    it('should detect testing intent from prompt', () => {
+      const intents = detectIntent('Bash', { command: 'vitest' }, {}, 'Run the tests');
+      expect(intents).toContain('testing');
+    });
+
+    it('should detect documentation intent from prompt', () => {
+      const intents = detectIntent('Write', { file_path: 'README.md' }, {}, 'Update the docs');
+      expect(intents).toContain('documentation');
+    });
+
+    it('should detect configuration intent from prompt', () => {
+      const intents = detectIntent('Edit', { file_path: 'config.json' }, {}, 'Update config settings');
+      expect(intents).toContain('configuration');
+    });
+
+    it('should detect optimization intent from prompt', () => {
+      const intents = detectIntent('Edit', { file_path: 'src/app.ts' }, {}, 'Optimize performance');
+      expect(intents).toContain('optimization');
+    });
+
+    it('should detect multiple intents', () => {
+      const intents = detectIntent('Edit', { file_path: 'src/app.test.ts' }, {}, 'Fix failing test');
+      expect(intents).toContain('bugfix');
+      expect(intents).toContain('testing');
+    });
+
+    it('should default to investigation for read tools without prompt', () => {
+      const intents = detectIntent('Read', { file_path: 'src/app.ts' }, {});
+      expect(intents).toContain('investigation');
+    });
+
+    it('should detect testing from Bash test commands', () => {
+      const intents = detectIntent('Bash', { command: 'npx vitest run' }, {});
+      expect(intents).toContain('testing');
+    });
+
+    it('should detect testing from test file paths', () => {
+      const intents = detectIntent('Edit', { file_path: 'src/__tests__/app.test.ts' }, {});
+      expect(intents).toContain('testing');
+    });
+
+    it('should detect documentation from .md write', () => {
+      const intents = detectIntent('Write', { file_path: 'docs/guide.md' }, {});
+      expect(intents).toContain('documentation');
+    });
+
+    it('should detect configuration from config file writes', () => {
+      const intents = detectIntent('Edit', { file_path: 'tsconfig.json' }, {});
+      expect(intents).toContain('configuration');
+    });
+
+    it('should fallback to investigation when no signals found', () => {
+      const intents = detectIntent('Task', {}, {});
+      expect(intents).toContain('investigation');
+    });
+  });
+
+  describe('extractIntents', () => {
+    it('should extract intent tags from concepts', () => {
+      const intents = extractIntents(['typescript', 'intent:bugfix', 'hooks', 'intent:testing']);
+      expect(intents).toEqual(['bugfix', 'testing']);
+    });
+
+    it('should return empty array when no intent tags', () => {
+      const intents = extractIntents(['typescript', 'hooks', 'api']);
+      expect(intents).toEqual([]);
+    });
+
+    it('should handle empty array', () => {
+      const intents = extractIntents([]);
+      expect(intents).toEqual([]);
     });
   });
 });

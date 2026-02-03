@@ -134,7 +134,7 @@ Return ONLY a JSON object (no markdown, no code fences) with these fields:
   "subtitle": "Brief context description (5-10 words, e.g. 'Examining authentication module')",
   "narrative": "One sentence explaining what happened and why (e.g. 'Read the authentication module to understand the login flow before making changes.')",
   "facts": ["Array of factual observations", "e.g. 'File auth.ts contains 150 lines'", "Max 5 facts"],
-  "concepts": ["Array of technical concepts/topics involved", "e.g. 'authentication', 'typescript'", "Max 5 concepts"]
+  "concepts": ["Array of technical concepts/topics involved", "e.g. 'authentication', 'typescript'", "Include 'intent:<type>' tags for: bugfix, feature, refactor, testing, investigation, documentation, configuration, optimization", "Max 5 concepts"]
 }`;
 }
 
