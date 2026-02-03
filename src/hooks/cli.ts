@@ -16,11 +16,13 @@
  *   user-message  - SessionStart: display status to user (stderr)
  *   enrich <id> [cwd] - Background: AI-enrich a stored observation
  *   enrich-summary <sessionId> <cwd> <transcriptPath> - Background: AI-enrich session summary
+ *   embed-session <cwd> - Background worker: process embedding queue
+ *   enrich-session <cwd> - Background worker: process enrichment queue
  *
  * @module @agentkits/memory/hooks/cli
  */
 
-import { parseHookInput, formatResponse, STANDARD_RESPONSE } from './types.js';
+import { parseHookInput, formatResponse, STANDARD_RESPONSE, HookResult } from './types.js';
 import { createContextHook } from './context.js';
 import { createSessionInitHook } from './session-init.js';
 import { createObservationHook } from './observation.js';
@@ -70,7 +72,7 @@ async function main(): Promise<void> {
 
     if (!event) {
       console.error('Usage: agentkits-memory-hook <event>');
-      console.error('Events: context, session-init, observation, summarize, user-message, enrich, enrich-summary, embed-session');
+      console.error('Events: context, session-init, observation, summarize, user-message, enrich, enrich-summary, embed-session, enrich-session');
       process.exit(1);
     }
 
@@ -108,8 +110,31 @@ async function main(): Promise<void> {
       const cwdArg = process.argv[3] || process.cwd();
       const svc = new MemoryHookService(cwdArg);
       await svc.initialize();
+      // Graceful shutdown on signals (cleanup lock file + DB)
+      const cleanup = async () => { try { await svc.shutdown(); } catch {} process.exit(0); };
+      process.on('SIGTERM', cleanup);
+      process.on('SIGINT', cleanup);
       try {
         await svc.processEmbeddingQueue();
+      } finally {
+        await svc.shutdown();
+      }
+      process.exit(0);
+    }
+
+    // Handle 'enrich-session' command (no stdin, runs as background process)
+    // Processes the SQLite enrichment queue — calls claude --print for each observation.
+    // Usage: enrich-session <cwd>
+    if (event === 'enrich-session') {
+      const cwdArg = process.argv[3] || process.cwd();
+      const svc = new MemoryHookService(cwdArg);
+      await svc.initialize();
+      // Graceful shutdown on signals (cleanup lock file + DB)
+      const cleanup = async () => { try { await svc.shutdown(); } catch {} process.exit(0); };
+      process.on('SIGTERM', cleanup);
+      process.on('SIGINT', cleanup);
+      try {
+        await svc.processEnrichmentQueue();
       } finally {
         await svc.shutdown();
       }
@@ -123,33 +148,41 @@ async function main(): Promise<void> {
     const input = parseHookInput(stdin);
 
     // Select and execute handler
-    let result;
+    let result: HookResult | undefined;
+    let hook: { execute(input: ReturnType<typeof parseHookInput>): Promise<HookResult>; shutdown(): Promise<void> } | null = null;
 
     switch (event) {
       case 'context':
-        result = await createContextHook(input.cwd).execute(input);
+        hook = createContextHook(input.cwd);
         break;
 
       case 'session-init':
-        result = await createSessionInitHook(input.cwd).execute(input);
+        hook = createSessionInitHook(input.cwd);
         break;
 
       case 'observation':
-        result = await createObservationHook(input.cwd).execute(input);
+        hook = createObservationHook(input.cwd);
         break;
 
       case 'summarize':
-        result = await createSummarizeHook(input.cwd).execute(input);
+        hook = createSummarizeHook(input.cwd);
         break;
 
       case 'user-message':
-        result = await createUserMessageHook(input.cwd).execute(input);
+        hook = createUserMessageHook(input.cwd);
         break;
 
       default:
         console.error(`Unknown event: ${event}`);
         console.log(JSON.stringify(STANDARD_RESPONSE));
         process.exit(0);
+    }
+
+    // Execute hook with guaranteed shutdown (closes DB connection)
+    try {
+      result = await hook!.execute(input);
+    } finally {
+      try { await hook!.shutdown(); } catch { /* ignore shutdown errors */ }
     }
 
     // Output response

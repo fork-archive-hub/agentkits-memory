@@ -133,10 +133,11 @@ function getDatabase(): BetterDatabase {
     );
   `);
 
-  // Embedding queue table (shared with hooks service)
+  // Task queue table (shared with hooks service — used for embed + enrich workers)
   _db.exec(`
-    CREATE TABLE IF NOT EXISTS embedding_queue (
+    CREATE TABLE IF NOT EXISTS task_queue (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_type TEXT NOT NULL,
       target_table TEXT NOT NULL,
       target_id TEXT NOT NULL,
       created_at INTEGER NOT NULL,

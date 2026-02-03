@@ -69,10 +69,13 @@ export class SummarizeHook implements EventHandler {
       const textSummary = await this.service.generateSummary(input.sessionId);
       await this.service.completeSession(input.sessionId, textSummary);
 
-      // Ensure embedding worker is running to process queued items
-      this.service.ensureEmbeddingWorkerRunning(input.cwd);
+      // Spawn background workers to process queued tasks (one per type, gated by lock file)
+      this.service.ensureWorkerRunning(input.cwd, 'embed-session', 'embed-worker.lock');
+      if (isAIEnrichmentEnabled()) {
+        this.service.ensureWorkerRunning(input.cwd, 'enrich-session', 'enrich-worker.lock');
+      }
 
-      // Fire-and-forget: spawn detached process for AI summary enrichment
+      // Summary enrichment needs transcript path — handled separately (not via queue)
       if (isAIEnrichmentEnabled() && input.transcriptPath) {
         try {
           const cliPath = path.resolve(input.cwd, 'dist/hooks/cli.js');
@@ -85,7 +88,7 @@ export class SummarizeHook implements EventHandler {
           });
           child.unref();
         } catch {
-          // Silently ignore — template summary already saved
+          // Silently ignore
         }
       }
 

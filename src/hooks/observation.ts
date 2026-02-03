@@ -7,15 +7,12 @@
  * @module @agentkits/memory/hooks/observation
  */
 
-import { spawn } from 'node:child_process';
-import * as path from 'node:path';
 import {
   NormalizedHookInput,
   HookResult,
   EventHandler,
 } from './types.js';
 import { MemoryHookService } from './service.js';
-import { isAIEnrichmentEnabled } from './ai-enrichment.js';
 
 /**
  * Tools to skip capturing (internal/noisy tools).
@@ -111,20 +108,8 @@ export class ObservationHook implements EventHandler {
         input.cwd
       );
 
-      // Fire-and-forget: spawn detached process for AI enrichment
-      if (isAIEnrichmentEnabled()) {
-        try {
-          const cliPath = path.resolve(input.cwd, 'dist/hooks/cli.js');
-          const child = spawn('node', [cliPath, 'enrich', obs.id, input.cwd], {
-            detached: true,
-            stdio: 'ignore',
-            env: { ...process.env },
-          });
-          child.unref();
-        } catch {
-          // Silently ignore — template data already saved
-        }
-      }
+      // Enrichment + embedding are queued in service.ts storeObservation()
+      // Workers are spawned at session end (summarize hook)
 
       return {
         continue: true,

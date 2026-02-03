@@ -7,7 +7,7 @@
  * @module @agentkits/memory/hooks/service
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, openSync, closeSync, constants as fsConstants } from 'node:fs';
 import { spawn } from 'node:child_process';
 import * as path from 'node:path';
 import Database from 'better-sqlite3';
@@ -168,7 +168,7 @@ export class MemoryHookService {
 
     // Queue embedding generation if insert succeeded
     if (id > 0) {
-      this.queueSessionEmbedding('user_prompts', id);
+      this.queueTask('embed', 'user_prompts', id);
     }
 
     return {
@@ -323,8 +323,9 @@ export class MemoryHookService {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(id, sessionId, project, toolName, inputStr, responseStr, cwd, now, type, title, promptNumber || null, JSON.stringify(filesRead), JSON.stringify(filesModified), subtitle, narrative, JSON.stringify(facts), JSON.stringify(concepts));
 
-    // Queue embedding generation
-    this.queueSessionEmbedding('observations', id);
+    // Queue background tasks (embedding + AI enrichment)
+    this.queueTask('embed', 'observations', id);
+    this.queueTask('enrich', 'observations', id);
 
     // Update session observation count
     this.db!.prepare(`
@@ -411,31 +412,33 @@ export class MemoryHookService {
   // ===== Embedding Queue + Worker =====
 
   /** Max records to process per worker invocation */
-  private static readonly EMBED_BATCH_LIMIT = 200;
+  private static readonly WORKER_BATCH_LIMIT = 200;
 
   /**
-   * Queue a session record for embedding generation.
-   * Inserts into SQLite embedding_queue table — atomic, no file I/O.
-   * Called from hook handlers — non-blocking, no model loading.
+   * Queue a background task. Inserts into SQLite task_queue — atomic, <1ms.
+   * Called from hook handlers — non-blocking, no model/API loading.
    */
-  queueSessionEmbedding(
-    table: 'observations' | 'user_prompts' | 'session_summaries',
+  queueTask(
+    taskType: 'embed' | 'enrich',
+    table: string,
     recordId: string | number
   ): void {
     if (!this.db) return;
     this.db.prepare(
-      'INSERT INTO embedding_queue (target_table, target_id, created_at) VALUES (?, ?, ?)'
-    ).run(table, String(recordId), Date.now());
+      'INSERT INTO task_queue (task_type, target_table, target_id, created_at) VALUES (?, ?, ?, ?)'
+    ).run(taskType, table, String(recordId), Date.now());
   }
 
   /**
-   * Spawn a detached embedding worker if not already running.
-   * Uses a lock file (PID-based) to prevent multiple concurrent workers.
+   * Spawn a detached background worker if not already running.
+   * Uses a PID-based lock file to prevent multiple concurrent workers.
+   * @param workerType - 'embed-session' or 'enrich-session'
+   * @param lockName - unique lock file name for this worker type
    */
-  ensureEmbeddingWorkerRunning(cwd: string): void {
-    const lockFile = path.join(path.dirname(this.dbPath), 'embed-worker.lock');
+  ensureWorkerRunning(cwd: string, workerType: string, lockName: string): void {
+    const lockFile = path.join(path.dirname(this.dbPath), lockName);
 
-    // Check if worker is already running
+    // Check if worker is already running (stale lock cleanup)
     if (existsSync(lockFile)) {
       try {
         const pid = parseInt(readFileSync(lockFile, 'utf-8').trim(), 10);
@@ -444,33 +447,53 @@ export class MemoryHookService {
             process.kill(pid, 0); // signal 0 = check if alive
             return; // Worker still running
           } catch {
-            // Stale lock, remove
+            // Process dead — remove stale lock
             try { unlinkSync(lockFile); } catch { /* ignore */ }
           }
+        } else {
+          try { unlinkSync(lockFile); } catch { /* ignore */ }
         }
       } catch {
         try { unlinkSync(lockFile); } catch { /* ignore */ }
       }
     }
 
-    // Spawn detached worker
+    // Atomic lock acquisition: O_CREAT | O_EXCL fails if file exists (prevents race)
+    let fd: number;
+    try {
+      fd = openSync(lockFile, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY);
+    } catch {
+      // Another process created the lock between our check and open — that's fine
+      return;
+    }
+
+    // Write PID placeholder (will be overwritten by worker with its actual PID)
+    try {
+      writeFileSync(lockFile, '0');
+      closeSync(fd);
+    } catch {
+      try { closeSync(fd); } catch { /* ignore */ }
+    }
+
+    // Spawn detached worker (worker writes its own PID to lock file on start)
     try {
       const cliPath = path.resolve(cwd, 'dist/hooks/cli.js');
-      const child = spawn('node', [cliPath, 'embed-session', cwd], {
+      const child = spawn('node', [cliPath, workerType, cwd], {
         detached: true,
         stdio: 'ignore',
         env: { ...process.env },
       });
       child.unref();
     } catch {
-      // Silently ignore
+      // Failed to spawn — clean up lock
+      try { unlinkSync(lockFile); } catch { /* ignore */ }
     }
   }
 
   /**
-   * Process the embedding queue. Called by the worker process.
-   * Loads embedding model ONCE. Processes queued items + any DB records missing embeddings.
-   * Uses lock file to prevent concurrent workers. Respects EMBED_BATCH_LIMIT.
+   * Process embedding tasks from the queue.
+   * Loads embedding model ONCE, processes queued items + DB catch-up.
+   * Uses lock file to prevent concurrent workers.
    */
   async processEmbeddingQueue(): Promise<number> {
     await this.ensureInitialized();
@@ -491,21 +514,26 @@ export class MemoryHookService {
         session_summaries: 'rowid',
       };
 
-      // Phase 1: Process queued items (claimed atomically)
-      while (count < MemoryHookService.EMBED_BATCH_LIMIT) {
-        // Claim next pending item
+      // Atomic claim: SELECT + UPDATE in a single transaction to prevent race conditions
+      const claimEmbedTask = this.db!.transaction(() => {
         const item = this.db!.prepare(
-          "SELECT id, target_table, target_id FROM embedding_queue WHERE status = 'pending' ORDER BY id ASC LIMIT 1"
+          "SELECT id, target_table, target_id FROM task_queue WHERE task_type = 'embed' AND status = 'pending' ORDER BY id ASC LIMIT 1"
         ).get() as { id: number; target_table: string; target_id: string } | undefined;
+        if (item) {
+          this.db!.prepare("UPDATE task_queue SET status = 'processing' WHERE id = ?").run(item.id);
+        }
+        return item;
+      });
+
+      // Phase 1: Process queued embed tasks
+      while (count < MemoryHookService.WORKER_BATCH_LIMIT) {
+        const item = claimEmbedTask();
 
         if (!item) break;
 
-        // Mark as processing
-        this.db!.prepare("UPDATE embedding_queue SET status = 'processing' WHERE id = ?").run(item.id);
-
         const idCol = idColMap[item.target_table];
         if (!idCol) {
-          this.db!.prepare('DELETE FROM embedding_queue WHERE id = ?').run(item.id);
+          this.db!.prepare('DELETE FROM task_queue WHERE id = ?').run(item.id);
           continue;
         }
 
@@ -515,8 +543,7 @@ export class MemoryHookService {
           ).get(item.target_id) as Record<string, unknown> | undefined;
 
           if (!row) {
-            // Already embedded or doesn't exist — remove from queue
-            this.db!.prepare('DELETE FROM embedding_queue WHERE id = ?').run(item.id);
+            this.db!.prepare('DELETE FROM task_queue WHERE id = ?').run(item.id);
             continue;
           }
 
@@ -524,51 +551,93 @@ export class MemoryHookService {
             item.target_table as 'observations' | 'user_prompts' | 'session_summaries', row
           );
           if (!text) {
-            this.db!.prepare('DELETE FROM embedding_queue WHERE id = ?').run(item.id);
+            this.db!.prepare('DELETE FROM task_queue WHERE id = ?').run(item.id);
             continue;
           }
 
           const result = await embService.embed(text);
           const buffer = Buffer.from(result.embedding.buffer, result.embedding.byteOffset, result.embedding.byteLength);
           this.db!.prepare(`UPDATE ${item.target_table} SET embedding = ? WHERE ${idCol} = ?`).run(buffer, item.target_id);
-          this.db!.prepare('DELETE FROM embedding_queue WHERE id = ?').run(item.id);
+          this.db!.prepare('DELETE FROM task_queue WHERE id = ?').run(item.id);
           count++;
         } catch {
-          // Mark as failed, will be retried on next worker run
-          this.db!.prepare("UPDATE embedding_queue SET status = 'pending' WHERE id = ?").run(item.id);
+          this.db!.prepare("UPDATE task_queue SET status = 'pending' WHERE id = ?").run(item.id);
         }
       }
 
-      // Phase 2: Catch up on any DB records missing embeddings (not in queue)
-      if (count < MemoryHookService.EMBED_BATCH_LIMIT) {
-        const tables = Object.entries(idColMap);
-        for (const [tableName, idCol] of tables) {
-          if (count >= MemoryHookService.EMBED_BATCH_LIMIT) break;
+      // Phase 2: Catch up on DB records missing embeddings
+      if (count < MemoryHookService.WORKER_BATCH_LIMIT) {
+        for (const [tableName, idCol] of Object.entries(idColMap)) {
+          if (count >= MemoryHookService.WORKER_BATCH_LIMIT) break;
           try {
-            const remaining = MemoryHookService.EMBED_BATCH_LIMIT - count;
+            const remaining = MemoryHookService.WORKER_BATCH_LIMIT - count;
             const rows = this.db!.prepare(
               `SELECT *, ${idCol} as _rid FROM ${tableName} WHERE embedding IS NULL ORDER BY rowid DESC LIMIT ?`
             ).all(remaining) as Record<string, unknown>[];
 
             for (const row of rows) {
-              if (count >= MemoryHookService.EMBED_BATCH_LIMIT) break;
+              if (count >= MemoryHookService.WORKER_BATCH_LIMIT) break;
               const text = this.getSessionEmbeddingText(
                 tableName as 'observations' | 'user_prompts' | 'session_summaries', row
               );
               if (!text) continue;
-
               try {
                 const result = await embService.embed(text);
                 const buffer = Buffer.from(result.embedding.buffer, result.embedding.byteOffset, result.embedding.byteLength);
                 this.db!.prepare(`UPDATE ${tableName} SET embedding = ? WHERE ${idCol} = ?`).run(buffer, row._rid);
                 count++;
-              } catch {
-                // Skip
-              }
+              } catch { /* skip */ }
             }
-          } catch {
-            // Table might not exist
+          } catch { /* table might not exist */ }
+        }
+      }
+    } finally {
+      try { unlinkSync(lockFile); } catch { /* ignore */ }
+    }
+
+    return count;
+  }
+
+  /**
+   * Process enrichment tasks from the queue.
+   * Calls claude --print sequentially for each observation.
+   * Uses lock file to prevent concurrent workers.
+   */
+  async processEnrichmentQueue(): Promise<number> {
+    await this.ensureInitialized();
+
+    const lockFile = path.join(path.dirname(this.dbPath), 'enrich-worker.lock');
+    writeFileSync(lockFile, String(process.pid));
+
+    let count = 0;
+    try {
+      // Atomic claim: SELECT + UPDATE in a single transaction to prevent race conditions
+      const claimEnrichTask = this.db!.transaction(() => {
+        const item = this.db!.prepare(
+          "SELECT id, target_table, target_id FROM task_queue WHERE task_type = 'enrich' AND status = 'pending' ORDER BY id ASC LIMIT 1"
+        ).get() as { id: number; target_table: string; target_id: string } | undefined;
+        if (item) {
+          this.db!.prepare("UPDATE task_queue SET status = 'processing' WHERE id = ?").run(item.id);
+        }
+        return item;
+      });
+
+      while (count < MemoryHookService.WORKER_BATCH_LIMIT) {
+        const item = claimEnrichTask();
+
+        if (!item) break;
+
+        try {
+          if (item.target_table === 'observations') {
+            await this.enrichObservation(item.target_id);
+          } else if (item.target_table === 'session_summaries') {
+            // Summary enrichment needs transcript path — skip from queue
+            // (handled separately in summarize hook with direct spawn)
           }
+          this.db!.prepare('DELETE FROM task_queue WHERE id = ?').run(item.id);
+          count++;
+        } catch {
+          this.db!.prepare("UPDATE task_queue SET status = 'pending' WHERE id = ?").run(item.id);
         }
       }
     } finally {
@@ -875,7 +944,7 @@ export class MemoryHookService {
 
     // Queue embedding generation
     if (id > 0) {
-      this.queueSessionEmbedding('session_summaries', id);
+      this.queueTask('embed', 'session_summaries', id);
     }
 
     return {
@@ -1043,10 +1112,12 @@ export class MemoryHookService {
       )
     `);
 
-    // Embedding queue: holds pending embed requests processed by a single worker
+    // Task queue: holds pending background tasks (embedding, enrichment)
+    // processed by single-instance workers with lock files
     this.db.exec(`
-      CREATE TABLE IF NOT EXISTS embedding_queue (
+      CREATE TABLE IF NOT EXISTS task_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_type TEXT NOT NULL,
         target_table TEXT NOT NULL,
         target_id TEXT NOT NULL,
         created_at INTEGER NOT NULL,
@@ -1062,7 +1133,7 @@ export class MemoryHookService {
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_prompts_session ON user_prompts(session_id)');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_summaries_session ON session_summaries(session_id)');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_summaries_project ON session_summaries(project)');
-    this.db.exec('CREATE INDEX IF NOT EXISTS idx_embed_queue_status ON embedding_queue(status)');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_task_queue_status ON task_queue(status, task_type)');
 
     // Migration: add prompt_number to existing observations table
     this.migrateSchema();
