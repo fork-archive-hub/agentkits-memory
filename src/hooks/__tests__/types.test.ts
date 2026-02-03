@@ -15,6 +15,8 @@ import {
   extractFilePaths,
   extractFacts,
   extractConcepts,
+  extractCodeDiffs,
+  formatDiffFact,
   detectIntent,
   extractIntents,
   truncate,
@@ -535,11 +537,13 @@ describe('Hook Types Utilities', () => {
       expect(facts).toContain('File created/updated: /src/new.ts');
     });
 
-    it('should extract facts from Edit', () => {
-      const facts = extractFacts('Edit', { file_path: '/src/index.ts', old_string: 'old code' }, {});
+    it('should extract facts from Edit with structured diff', () => {
+      const facts = extractFacts('Edit', { file_path: '/src/index.ts', old_string: 'old code', new_string: 'new code' }, {});
       expect(facts.length).toBe(2);
       expect(facts[0]).toContain('/src/index.ts');
-      expect(facts[1]).toContain('replaced');
+      expect(facts[1]).toContain('DIFF');
+      expect(facts[1]).toContain('old code');
+      expect(facts[1]).toContain('new code');
     });
 
     it('should extract facts from Bash with test results', () => {
@@ -595,7 +599,20 @@ describe('Hook Types Utilities', () => {
       expect(facts).toContain('Errors encountered');
     });
 
-    it('should handle MultiEdit like Edit', () => {
+    it('should handle MultiEdit with edits array', () => {
+      const facts = extractFacts('MultiEdit', {
+        file_path: 'app.ts',
+        edits: [
+          { old_string: 'const x = 1', new_string: 'const x = 2' },
+          { old_string: 'let y = 3', new_string: 'let y = 4' },
+        ],
+      }, {});
+      expect(facts).toContain('File modified: app.ts');
+      expect(facts.some(f => f.includes('DIFF'))).toBe(true);
+      expect(facts.some(f => f.includes('const x = 1'))).toBe(true);
+    });
+
+    it('should fallback to Code replaced for MultiEdit without edits array', () => {
       const facts = extractFacts('MultiEdit', { file_path: 'app.ts', old_string: 'old' }, {});
       expect(facts).toContain('File modified: app.ts');
       expect(facts.some(f => f.includes('Code replaced'))).toBe(true);
@@ -741,6 +758,121 @@ describe('Hook Types Utilities', () => {
     it('should handle empty array', () => {
       const intents = extractIntents([]);
       expect(intents).toEqual([]);
+    });
+  });
+
+  describe('extractCodeDiffs', () => {
+    it('should extract diff from Edit tool', () => {
+      const diffs = extractCodeDiffs('Edit', {
+        file_path: 'src/auth.ts',
+        old_string: 'function login(user) {',
+        new_string: 'function login(user, opts) {',
+      });
+      expect(diffs).toHaveLength(1);
+      expect(diffs[0].file).toBe('src/auth.ts');
+      expect(diffs[0].before).toBe('function login(user) {');
+      expect(diffs[0].after).toBe('function login(user, opts) {');
+    });
+
+    it('should extract multiple diffs from MultiEdit', () => {
+      const diffs = extractCodeDiffs('MultiEdit', {
+        file_path: 'src/app.ts',
+        edits: [
+          { old_string: 'const a = 1;', new_string: 'const a = 2;' },
+          { old_string: 'let b = true;', new_string: 'let b = false;' },
+        ],
+      });
+      expect(diffs).toHaveLength(2);
+      expect(diffs[0].before).toBe('const a = 1;');
+      expect(diffs[1].before).toBe('let b = true;');
+    });
+
+    it('should return empty array for non-Edit tools', () => {
+      expect(extractCodeDiffs('Read', { file_path: 'a.ts' })).toEqual([]);
+      expect(extractCodeDiffs('Bash', { command: 'test' })).toEqual([]);
+      expect(extractCodeDiffs('Write', { file_path: 'a.ts' })).toEqual([]);
+    });
+
+    it('should truncate long strings to 200 chars', () => {
+      const longStr = 'x'.repeat(300);
+      const diffs = extractCodeDiffs('Edit', {
+        file_path: 'a.ts',
+        old_string: longStr,
+        new_string: 'short',
+      });
+      expect(diffs[0].before.length).toBe(200);
+      expect(diffs[0].after).toBe('short');
+    });
+
+    it('should calculate changeLines correctly', () => {
+      const diffs = extractCodeDiffs('Edit', {
+        file_path: 'a.ts',
+        old_string: 'line1',
+        new_string: 'line1\nline2\nline3',
+      });
+      expect(diffs[0].changeLines).toBe(2); // 3 lines - 1 line = +2
+    });
+
+    it('should cap MultiEdit at 5 edits', () => {
+      const edits = Array.from({ length: 10 }, (_, i) => ({
+        old_string: `old${i}`,
+        new_string: `new${i}`,
+      }));
+      const diffs = extractCodeDiffs('MultiEdit', { file_path: 'a.ts', edits });
+      expect(diffs).toHaveLength(5);
+    });
+
+    it('should handle JSON string input', () => {
+      const diffs = extractCodeDiffs('Edit', JSON.stringify({
+        file_path: 'src/app.ts',
+        old_string: 'before',
+        new_string: 'after',
+      }));
+      expect(diffs).toHaveLength(1);
+      expect(diffs[0].before).toBe('before');
+    });
+
+    it('should handle missing old_string or new_string', () => {
+      const diffs = extractCodeDiffs('Edit', { file_path: 'a.ts' });
+      expect(diffs).toEqual([]);
+    });
+  });
+
+  describe('formatDiffFact', () => {
+    it('should format diff as compact fact string', () => {
+      const fact = formatDiffFact({
+        file: 'src/auth.ts',
+        before: 'function login(user) {',
+        after: 'function login(user, opts) {',
+        changeLines: 0,
+      });
+      expect(fact).toContain('DIFF');
+      expect(fact).toContain('auth.ts');
+      expect(fact).toContain('function login(user) {');
+      expect(fact).toContain('function login(user, opts) {');
+    });
+
+    it('should use filename only (not full path)', () => {
+      const fact = formatDiffFact({
+        file: '/very/long/path/to/file.ts',
+        before: 'old',
+        after: 'new',
+        changeLines: 0,
+      });
+      expect(fact).toContain('file.ts');
+      expect(fact).not.toContain('/very/long');
+    });
+
+    it('should truncate long first lines to 60 chars', () => {
+      const longLine = 'x'.repeat(100);
+      const fact = formatDiffFact({
+        file: 'a.ts',
+        before: longLine,
+        after: 'short',
+        changeLines: 0,
+      });
+      // First line is truncated to 60 chars
+      expect(fact.length).toBeLessThan(200);
     });
   });
 });

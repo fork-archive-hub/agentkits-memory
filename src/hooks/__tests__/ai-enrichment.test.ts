@@ -569,6 +569,50 @@ describe('AI Enrichment Module', () => {
     it('should return null for invalid JSON', () => {
       expect(parseSummaryResponse('not json')).toBeNull();
     });
+
+    it('should parse decisions array', () => {
+      const json = JSON.stringify({
+        completed: 'Fixed the bug.',
+        nextSteps: 'None',
+        decisions: ['Used mutex for thread safety', 'Chose retry pattern over circuit breaker'],
+      });
+      const result = parseSummaryResponse(json);
+      expect(result).not.toBeNull();
+      expect(result!.decisions).toHaveLength(2);
+      expect(result!.decisions[0]).toBe('Used mutex for thread safety');
+    });
+
+    it('should default to empty decisions when not provided', () => {
+      const json = JSON.stringify({
+        completed: 'Done.',
+        nextSteps: 'None',
+      });
+      const result = parseSummaryResponse(json);
+      expect(result).not.toBeNull();
+      expect(result!.decisions).toEqual([]);
+    });
+
+    it('should cap decisions at 5 items', () => {
+      const json = JSON.stringify({
+        completed: 'Done.',
+        nextSteps: 'None',
+        decisions: Array.from({ length: 10 }, (_, i) => `Decision ${i}`),
+      });
+      const result = parseSummaryResponse(json);
+      expect(result).not.toBeNull();
+      expect(result!.decisions).toHaveLength(5);
+    });
+
+    it('should filter out non-string decisions', () => {
+      const json = JSON.stringify({
+        completed: 'Done.',
+        nextSteps: 'None',
+        decisions: ['Valid', 123, null, '', 'Also valid'],
+      });
+      const result = parseSummaryResponse(json);
+      expect(result).not.toBeNull();
+      expect(result!.decisions).toEqual(['Valid', 'Also valid']);
+    });
   });
 
   describe('buildSummaryPrompt', () => {
@@ -586,6 +630,12 @@ describe('AI Enrichment Module', () => {
       const prompt = buildSummaryPrompt(longTemplate, longMessage);
       // Should contain truncated versions (3000 chars each)
       expect(prompt.length).toBeLessThan(10000);
+    });
+
+    it('should ask for decisions in prompt', () => {
+      const prompt = buildSummaryPrompt('Request: Fix auth', 'Fixed the auth flow.');
+      expect(prompt).toContain('decisions');
+      expect(prompt).toContain('WHY');
     });
   });
 

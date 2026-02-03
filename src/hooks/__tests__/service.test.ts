@@ -1118,6 +1118,149 @@ describe('MemoryHookService', () => {
 
   // ===== Feature #9: Export/Import =====
 
+  describe('structured diff capture', () => {
+    it('should include diff facts for Edit observations', async () => {
+      await service.initialize();
+      await service.initSession('diff-session', 'test-project');
+      const obs = await service.storeObservation(
+        'diff-session', 'test-project', 'Edit',
+        { file_path: 'src/auth.ts', old_string: 'function login(user) {', new_string: 'function login(user, opts) {' },
+        {}, TEST_DIR
+      );
+
+      expect(obs.facts).toBeDefined();
+      expect(obs.facts!.some(f => f.includes('DIFF'))).toBe(true);
+      expect(obs.facts!.some(f => f.includes('function login(user) {'))).toBe(true);
+      expect(obs.facts!.some(f => f.includes('function login(user, opts) {'))).toBe(true);
+    });
+
+    it('should include diff info in narrative for Edit', async () => {
+      await service.initialize();
+      await service.initSession('diff-session-2', 'test-project');
+      const obs = await service.storeObservation(
+        'diff-session-2', 'test-project', 'Edit',
+        { file_path: 'src/app.ts', old_string: 'const x = 1;', new_string: 'const x = 2;' },
+        {}, TEST_DIR
+      );
+
+      expect(obs.narrative).toBeDefined();
+      expect(obs.narrative).toContain('const x = 1;');
+      expect(obs.narrative).toContain('const x = 2;');
+    });
+
+    it('should handle MultiEdit with multiple diffs', async () => {
+      await service.initialize();
+      await service.initSession('multi-diff', 'test-project');
+      const obs = await service.storeObservation(
+        'multi-diff', 'test-project', 'MultiEdit',
+        {
+          file_path: 'src/index.ts',
+          edits: [
+            { old_string: 'import { a } from "./a"', new_string: 'import { a, b } from "./a"' },
+            { old_string: 'export default a;', new_string: 'export default { a, b };' },
+          ],
+        },
+        {}, TEST_DIR
+      );
+
+      expect(obs.facts!.filter(f => f.includes('DIFF')).length).toBe(2);
+    });
+  });
+
+  describe('decision rationale in summaries', () => {
+    it('should extract decisions from Edit observations', async () => {
+      await service.initialize();
+      await service.initSession('decision-session', 'test-project');
+      await service.saveUserPrompt('decision-session', 'test-project', 'Fix the auth bug');
+
+      await service.storeObservation(
+        'decision-session', 'test-project', 'Edit',
+        { file_path: 'src/auth.ts', old_string: 'function login(user) {', new_string: 'function login(user, opts) {' },
+        {}, TEST_DIR
+      );
+
+      const summary = await service.generateStructuredSummary('decision-session');
+
+      expect(summary.decisions).toBeDefined();
+      expect(summary.decisions.length).toBeGreaterThan(0);
+      expect(summary.decisions[0]).toContain('auth.ts');
+      expect(summary.decisions[0]).toContain('function login');
+    });
+
+    it('should include intent tags in decisions', async () => {
+      await service.initialize();
+      await service.initSession('intent-decision', 'test-project');
+      await service.saveUserPrompt('intent-decision', 'test-project', 'Refactor the handler');
+
+      await service.storeObservation(
+        'intent-decision', 'test-project', 'Edit',
+        { file_path: 'src/handler.ts', old_string: 'async handle(req)', new_string: 'async handleRequest(req, res)' },
+        {}, TEST_DIR
+      );
+
+      const summary = await service.generateStructuredSummary('intent-decision');
+
+      expect(summary.decisions.length).toBeGreaterThan(0);
+      expect(summary.decisions[0]).toContain('refactor');
+    });
+
+    it('should include decisions in saved session summaries', async () => {
+      await service.initialize();
+      await service.initSession('saved-decision', 'test-project');
+      await service.saveUserPrompt('saved-decision', 'test-project', 'Add feature');
+
+      await service.storeObservation(
+        'saved-decision', 'test-project', 'Edit',
+        { file_path: 'src/feature.ts', old_string: 'const x = 1;', new_string: 'const x = getValue();' },
+        {}, TEST_DIR
+      );
+
+      const structured = await service.generateStructuredSummary('saved-decision');
+      const saved = await service.saveSessionSummary(structured);
+
+      expect(saved.decisions).toBeDefined();
+      expect(saved.decisions.length).toBeGreaterThan(0);
+
+      // Verify it roundtrips through DB
+      const summaries = await service.getRecentSummaries('test-project');
+      const found = summaries.find(s => s.sessionId === 'saved-decision');
+      expect(found).toBeDefined();
+      expect(found!.decisions.length).toBeGreaterThan(0);
+    });
+
+    it('should return empty decisions when no Edit observations', async () => {
+      await service.initialize();
+      await service.initSession('no-decision', 'test-project');
+      await service.storeObservation(
+        'no-decision', 'test-project', 'Read',
+        { file_path: 'src/app.ts' }, {}, TEST_DIR
+      );
+
+      const summary = await service.generateStructuredSummary('no-decision');
+
+      expect(summary.decisions).toEqual([]);
+    });
+
+    it('should show decisions in context markdown', async () => {
+      await service.initialize();
+      await service.initSession('ctx-decision', 'test-project');
+      await service.saveUserPrompt('ctx-decision', 'test-project', 'Fix bug');
+
+      await service.storeObservation(
+        'ctx-decision', 'test-project', 'Edit',
+        { file_path: 'src/fix.ts', old_string: 'return null;', new_string: 'return defaultValue;' },
+        {}, TEST_DIR
+      );
+
+      const structured = await service.generateStructuredSummary('ctx-decision');
+      await service.saveSessionSummary(structured);
+      await service.completeSession('ctx-decision', 'Done');
+
+      const ctx = await service.getContext('test-project');
+      expect(ctx.markdown).toContain('Decisions');
+    });
+  });
+
   describe('export/import', () => {
     it('should export sessions with observations and prompts', async () => {
       await service.initialize();

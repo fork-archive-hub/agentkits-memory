@@ -332,6 +332,80 @@ export function extractIntents(concepts: string[]): ObservationIntent[] {
     .map(c => c.slice(7) as ObservationIntent);
 }
 
+// ===== Code Diff Types =====
+
+/**
+ * Structured code diff from Edit/MultiEdit operations.
+ * Captures before/after snippets for understanding what changed.
+ */
+export interface CodeDiff {
+  /** File path that was edited */
+  file: string;
+  /** Code before the change (truncated) */
+  before: string;
+  /** Code after the change (truncated) */
+  after: string;
+  /** Net line count change (positive=added, negative=removed) */
+  changeLines: number;
+}
+
+/**
+ * Extract structured code diffs from Edit/MultiEdit tool input.
+ * Returns compact before/after snippets (truncated to 200 chars each).
+ * For MultiEdit, captures up to 5 edits.
+ */
+export function extractCodeDiffs(toolName: string, toolInput: unknown): CodeDiff[] {
+  if (toolName !== 'Edit' && toolName !== 'MultiEdit') return [];
+
+  try {
+    const input = typeof toolInput === 'string' ? JSON.parse(toolInput) : toolInput;
+    const diffs: CodeDiff[] = [];
+    const file = (input?.file_path || input?.path || '') as string;
+
+    if (toolName === 'Edit') {
+      const oldStr = (input?.old_string || '') as string;
+      const newStr = (input?.new_string || '') as string;
+      if (oldStr || newStr) {
+        diffs.push({
+          file,
+          before: oldStr.substring(0, 200),
+          after: newStr.substring(0, 200),
+          changeLines: newStr.split('\n').length - oldStr.split('\n').length,
+        });
+      }
+    } else if (toolName === 'MultiEdit') {
+      const edits = (input?.edits || []) as Array<{ old_string?: string; new_string?: string }>;
+      for (const edit of edits.slice(0, 5)) {
+        const oldStr = (edit?.old_string || '') as string;
+        const newStr = (edit?.new_string || '') as string;
+        if (oldStr || newStr) {
+          diffs.push({
+            file,
+            before: oldStr.substring(0, 200),
+            after: newStr.substring(0, 200),
+            changeLines: newStr.split('\n').length - oldStr.split('\n').length,
+          });
+        }
+      }
+    }
+
+    return diffs;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Format a code diff as a compact fact string.
+ * Example: `DIFF src/auth.ts: "function auth(user)" → "function auth(user, opts)"`
+ */
+export function formatDiffFact(diff: CodeDiff): string {
+  const fileName = diff.file.split(/[/\\]/).pop() || diff.file;
+  const beforeLine = diff.before.split('\n')[0].trim().substring(0, 60);
+  const afterLine = diff.after.split('\n')[0].trim().substring(0, 60);
+  return `DIFF ${fileName}: "${beforeLine}" → "${afterLine}"`;
+}
+
 /**
  * Session record for tracking
  */
@@ -420,6 +494,9 @@ export interface SessionSummary {
 
   /** Additional notes */
   notes: string;
+
+  /** Decision rationale — why key changes were made */
+  decisions: string[];
 
   /** Which prompt triggered this summary */
   promptNumber: number;
@@ -522,6 +599,7 @@ export interface ExportSummary {
   filesModified: string[];
   nextSteps: string;
   notes: string;
+  decisions: string[];
 }
 
 /**
@@ -784,6 +862,15 @@ export function generateObservationNarrative(
         return `Wrote ${filePath || 'a file'} with new or updated content.`;
       case 'Edit':
       case 'MultiEdit': {
+        const diffs = extractCodeDiffs(toolName, toolInput);
+        if (diffs.length > 0) {
+          const diffDescs = diffs.map(d => {
+            const bLine = d.before.split('\n')[0].trim().substring(0, 50);
+            const aLine = d.after.split('\n')[0].trim().substring(0, 50);
+            return `"${bLine}" → "${aLine}"`;
+          });
+          return `Edited ${filePath || 'a file'}: ${diffDescs.join('; ')}.`;
+        }
         const oldStr = input?.old_string ? `"${input.old_string.substring(0, 40)}..."` : 'code';
         return `Edited ${filePath || 'a file'}, replacing ${oldStr} with updated content.`;
       }
@@ -834,10 +921,18 @@ export function extractFacts(toolName: string, toolInput: unknown, toolResponse:
         if (filePath) facts.push(`File created/updated: ${filePath}`);
         break;
       case 'Edit':
-      case 'MultiEdit':
+      case 'MultiEdit': {
         if (filePath) facts.push(`File modified: ${filePath}`);
-        if (input?.old_string) facts.push(`Code replaced in ${filePath.split(/[/\\]/).pop() || 'file'}`);
+        // Extract structured code diffs
+        const diffs = extractCodeDiffs(toolName, toolInput);
+        for (const diff of diffs) {
+          facts.push(formatDiffFact(diff));
+        }
+        if (diffs.length === 0 && input?.old_string) {
+          facts.push(`Code replaced in ${filePath.split(/[/\\]/).pop() || 'file'}`);
+        }
         break;
+      }
       case 'Bash': {
         const cmd = input?.command || '';
         facts.push(`Command executed: ${cmd.substring(0, 100)}`);

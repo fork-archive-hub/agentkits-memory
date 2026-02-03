@@ -28,6 +28,8 @@ import {
   extractConcepts,
   detectIntent,
   extractIntents,
+  extractCodeDiffs,
+  formatDiffFact,
   truncate,
   computeContentHash,
   ContextConfig,
@@ -992,6 +994,9 @@ export class MemoryHookService {
         if (summary.filesModified.length > 0) {
           lines.push(`**Files Modified:** ${summary.filesModified.slice(0, 10).join(', ')}`);
         }
+        if (summary.decisions && summary.decisions.length > 0) {
+          lines.push(`**Decisions:** ${summary.decisions.slice(0, 5).join('; ')}`);
+        }
         if (summary.nextSteps) {
           lines.push(`**Next Steps:** ${summary.nextSteps}`);
         }
@@ -1137,10 +1142,11 @@ export class MemoryHookService {
     const prompts = await this.getSessionPrompts(sessionId);
     const session = this.getSession(sessionId);
 
-    // Extract file paths from observations
+    // Extract file paths, commands, and decisions from observations
     const filesRead: Set<string> = new Set();
     const filesModified: Set<string> = new Set();
     const commands: string[] = [];
+    const decisions: string[] = [];
 
     for (const obs of observations) {
       try {
@@ -1151,6 +1157,22 @@ export class MemoryHookService {
           filesRead.add(filePath);
         } else if (obs.type === 'write' && filePath) {
           filesModified.add(filePath);
+
+          // Extract decision rationale from Edit/MultiEdit diffs
+          if (obs.toolName === 'Edit' || obs.toolName === 'MultiEdit') {
+            const diffs = extractCodeDiffs(obs.toolName, input);
+            const intents = extractIntents(obs.concepts || []);
+            const intentLabel = intents.length > 0 ? ` (${intents.join(', ')})` : '';
+            const fileName = filePath.split(/[/\\]/).pop() || filePath;
+
+            for (const diff of diffs.slice(0, 2)) {
+              const beforeLine = diff.before.split('\n')[0].trim().substring(0, 40);
+              const afterLine = diff.after.split('\n')[0].trim().substring(0, 40);
+              if (beforeLine && afterLine && beforeLine !== afterLine) {
+                decisions.push(`${fileName}${intentLabel}: "${beforeLine}" → "${afterLine}"`);
+              }
+            }
+          }
         } else if (obs.type === 'execute' && input.command) {
           commands.push(input.command.substring(0, 80));
         }
@@ -1189,6 +1211,7 @@ export class MemoryHookService {
       filesModified: Array.from(filesModified).slice(0, 20),
       nextSteps: '',
       notes,
+      decisions: decisions.slice(0, 10),
       promptNumber: prompts.length,
     };
   }
@@ -1204,8 +1227,8 @@ export class MemoryHookService {
     const now = Date.now();
     const result = this.db!.prepare(`
       INSERT INTO session_summaries
-      (session_id, project, request, completed, files_read, files_modified, next_steps, notes, prompt_number, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (session_id, project, request, completed, files_read, files_modified, next_steps, notes, decisions, prompt_number, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       summary.sessionId,
       summary.project,
@@ -1215,6 +1238,7 @@ export class MemoryHookService {
       JSON.stringify(summary.filesModified),
       summary.nextSteps,
       summary.notes,
+      JSON.stringify(summary.decisions || []),
       summary.promptNumber,
       now
     );
@@ -1283,12 +1307,17 @@ export class MemoryHookService {
     const enriched = await enrichSummaryWithAI(templateText, lastMessage).catch(() => null);
     if (!enriched) return false;
 
-    // Update summary in-place
+    // Update summary in-place (including AI-extracted decisions if available)
     this.db!.prepare(`
       UPDATE session_summaries
-      SET completed = ?, next_steps = ?
+      SET completed = ?, next_steps = ?, decisions = ?
       WHERE id = ?
-    `).run(enriched.completed, enriched.nextSteps, summary.id);
+    `).run(
+      enriched.completed,
+      enriched.nextSteps,
+      JSON.stringify(enriched.decisions || summary.decisions || []),
+      summary.id
+    );
 
     return true;
   }
@@ -1304,6 +1333,7 @@ export class MemoryHookService {
       filesModified: JSON.parse((row.files_modified as string) || '[]'),
       nextSteps: row.next_steps as string || '',
       notes: row.notes as string || '',
+      decisions: JSON.parse((row.decisions as string) || '[]'),
       promptNumber: row.prompt_number as number || 0,
       createdAt: row.created_at as number,
     };
@@ -1498,6 +1528,7 @@ export class MemoryHookService {
           filesModified: JSON.parse((summary.files_modified as string) || '[]'),
           nextSteps: summary.next_steps as string,
           notes: summary.notes as string,
+          decisions: JSON.parse((summary.decisions as string) || '[]'),
         } : undefined,
       });
     }
@@ -1597,12 +1628,13 @@ export class MemoryHookService {
         if (session.summary) {
           const s = session.summary;
           this.db!.prepare(`
-            INSERT INTO session_summaries (session_id, project, request, completed, files_read, files_modified, next_steps, notes, prompt_number, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO session_summaries (session_id, project, request, completed, files_read, files_modified, next_steps, notes, decisions, prompt_number, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `).run(
             newSessionId, session.project, s.request, s.completed,
             JSON.stringify(s.filesRead || []), JSON.stringify(s.filesModified || []),
-            s.nextSteps || '', s.notes || '', session.prompts.length, Date.now()
+            s.nextSteps || '', s.notes || '', JSON.stringify(s.decisions || []),
+            session.prompts.length, Date.now()
           );
         }
       }
@@ -1696,6 +1728,7 @@ export class MemoryHookService {
         files_modified TEXT DEFAULT '[]',
         next_steps TEXT,
         notes TEXT,
+        decisions TEXT DEFAULT '[]',
         prompt_number INTEGER,
         created_at INTEGER NOT NULL,
         embedding BLOB,
@@ -1790,6 +1823,14 @@ export class MemoryHookService {
         const sessionCols = this.db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>;
         if (!sessionCols.some(c => c.name === 'parent_session_id')) {
           this.db.exec('ALTER TABLE sessions ADD COLUMN parent_session_id TEXT');
+        }
+      } catch { /* ignore */ }
+
+      // Migrate session_summaries: add decisions column
+      try {
+        const summaryCols = this.db.prepare("PRAGMA table_info(session_summaries)").all() as Array<{ name: string }>;
+        if (!summaryCols.some(c => c.name === 'decisions')) {
+          this.db.exec("ALTER TABLE session_summaries ADD COLUMN decisions TEXT DEFAULT '[]'");
         }
       } catch { /* ignore */ }
 

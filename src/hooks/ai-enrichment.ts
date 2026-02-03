@@ -249,6 +249,7 @@ export function _setRunClaudePrintMockForTesting(
 export interface EnrichedSummary {
   completed: string;
   nextSteps: string;
+  decisions: string[];
 }
 
 /**
@@ -269,7 +270,8 @@ ${lastAssistantMessage.substring(0, 3000)}
 Return ONLY a JSON object (no markdown, no code fences) with these fields:
 {
   "completed": "Concise paragraph describing what was actually completed (2-4 sentences). Merge info from both the template summary and the assistant's final message.",
-  "nextSteps": "Concise list of remaining work or follow-up items, if any. Use 'None' if everything was completed."
+  "nextSteps": "Concise list of remaining work or follow-up items, if any. Use 'None' if everything was completed.",
+  "decisions": ["Array of key decision rationales — WHY specific changes were made, not just WHAT changed. E.g. 'Used mutex for token refresh to prevent race condition'. Max 5 decisions. Empty array if no clear decisions."]
 }`;
 }
 
@@ -300,9 +302,19 @@ export function parseSummaryResponse(text: string): EnrichedSummary | null {
       nextSteps = 'None';
     }
 
+    // Handle decisions: accept array or empty
+    let decisions: string[] = [];
+    if (Array.isArray(parsed.decisions)) {
+      decisions = parsed.decisions
+        .filter((d: unknown) => typeof d === 'string' && d.length > 0)
+        .slice(0, 5)
+        .map((d: unknown) => String(d).substring(0, 200));
+    }
+
     return {
       completed: completed.substring(0, 1000),
       nextSteps: nextSteps.substring(0, 500),
+      decisions,
     };
   } catch {
     return null;
