@@ -118,29 +118,35 @@ npx agentkits-memory-web
 
 その後、ブラウザで**http://localhost:1905**を開きます。
 
+### セッションリスト
+
+タイムラインビューとアクティビティ詳細で全セッションを閲覧します。
+
+![Session List](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-session-list_v2.png)
+
 ### メモリリスト
 
 検索と名前空間フィルタリングで保存されたすべてのメモリを閲覧します。
 
-![Memory List](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-list.png)
+![Memory List](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-list_v2.png)
 
 ### メモリを追加
 
 キー、名前空間、タイプ、コンテンツ、タグで新しいメモリを作成します。
 
-![Add Memory](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-add-memory.png)
+![Add Memory](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-add-memory_v2.png)
 
 ### メモリの詳細
 
 編集および削除オプション付きでメモリの完全な詳細を表示します。
 
-![Memory Detail](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-detail.png)
+![Memory Detail](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-detail_v2.png)
 
 ### 埋め込み管理
 
 セマンティック検索用のベクトル埋め込みを生成および管理します。
 
-![Manage Embeddings](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-embedding.png)
+![Manage Embeddings](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-embedding_v2.png)
 
 ---
 

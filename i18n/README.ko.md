@@ -118,29 +118,35 @@ npx agentkits-memory-web
 
 그런 다음 브라우저에서 **http://localhost:1905**를 엽니다.
 
+### 세션 목록
+
+타임라인 뷰와 활동 세부사항으로 모든 세션을 탐색합니다.
+
+![Session List](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-session-list_v2.png)
+
 ### 메모리 목록
 
 검색 및 네임스페이스 필터링으로 저장된 모든 메모리를 탐색합니다.
 
-![Memory List](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-list.png)
+![Memory List](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-list_v2.png)
 
 ### 메모리 추가
 
 키, 네임스페이스, 유형, 콘텐츠, 태그로 새 메모리를 생성합니다.
 
-![Add Memory](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-add-memory.png)
+![Add Memory](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-add-memory_v2.png)
 
 ### 메모리 세부사항
 
 편집 및 삭제 옵션과 함께 전체 메모리 세부사항을 봅니다.
 
-![Memory Detail](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-detail.png)
+![Memory Detail](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-detail_v2.png)
 
 ### 임베딩 관리
 
 의미 검색을 위한 벡터 임베딩을 생성하고 관리합니다.
 
-![Manage Embeddings](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-embedding.png)
+![Manage Embeddings](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-embedding_v2.png)
 
 ---
 

@@ -118,29 +118,35 @@ npx agentkits-memory-web
 
 Puis ouvrez **http://localhost:1905** dans votre navigateur.
 
+### Liste des Sessions
+
+Parcourez toutes les sessions avec vue chronologique et détails d'activité.
+
+![Session List](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-session-list_v2.png)
+
 ### Liste des Mémoires
 
 Parcourez toutes les mémoires stockées avec recherche et filtrage par namespace.
 
-![Memory List](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-list.png)
+![Memory List](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-list_v2.png)
 
 ### Ajouter une Mémoire
 
 Créez de nouvelles mémoires avec clé, namespace, type, contenu et tags.
 
-![Add Memory](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-add-memory.png)
+![Add Memory](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-add-memory_v2.png)
 
 ### Détails de la Mémoire
 
 Visualisez les détails complets d'une mémoire avec options d'édition et de suppression.
 
-![Memory Detail](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-detail.png)
+![Memory Detail](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-detail_v2.png)
 
 ### Gérer les Embeddings
 
 Générez et gérez les embeddings vectoriels pour la recherche sémantique.
 
-![Manage Embeddings](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-embedding.png)
+![Manage Embeddings](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-embedding_v2.png)
 
 ---
 

@@ -118,29 +118,35 @@ npx agentkits-memory-web
 
 Затем откройте **http://localhost:1905** в браузере.
 
+### Список сеансов
+
+Просмотр всех сеансов с хронологией и деталями активности.
+
+![Session List](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-session-list_v2.png)
+
 ### Список воспоминаний
 
 Просмотр всех сохранённых воспоминаний с поиском и фильтрацией по пространству имён.
 
-![Memory List](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-list.png)
+![Memory List](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-list_v2.png)
 
 ### Добавление воспоминания
 
 Создание новых воспоминаний с ключом, пространством имён, типом, содержимым и тегами.
 
-![Add Memory](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-add-memory.png)
+![Add Memory](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-add-memory_v2.png)
 
 ### Детали воспоминания
 
 Просмотр полных деталей воспоминания с возможностью редактирования и удаления.
 
-![Memory Detail](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-detail.png)
+![Memory Detail](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-detail_v2.png)
 
 ### Управление эмбеддингами
 
 Генерация и управление векторными эмбеддингами для семантического поиска.
 
-![Manage Embeddings](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-embedding.png)
+![Manage Embeddings](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-embedding_v2.png)
 
 ---
 

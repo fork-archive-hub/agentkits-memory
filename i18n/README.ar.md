@@ -118,29 +118,35 @@ npx agentkits-memory-web
 
 ثم افتح **http://localhost:1905** في متصفحك.
 
+### قائمة الجلسات
+
+تصفح جميع الجلسات مع عرض الجدول الزمني وتفاصيل النشاط.
+
+![Session List](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-session-list_v2.png)
+
 ### قائمة الذاكرة
 
 تصفح جميع الذكريات المخزنة مع البحث وتصفية مساحة الاسم.
 
-![Memory List](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-list.png)
+![Memory List](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-list_v2.png)
 
 ### إضافة ذاكرة
 
 أنشئ ذكريات جديدة بمفتاح ومساحة اسم ونوع ومحتوى ووسوم.
 
-![Add Memory](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-add-memory.png)
+![Add Memory](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-add-memory_v2.png)
 
 ### تفاصيل الذاكرة
 
 اعرض تفاصيل الذاكرة الكاملة مع خيارات التحرير والحذف.
 
-![Memory Detail](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-detail.png)
+![Memory Detail](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-detail_v2.png)
 
 ### إدارة التضمينات
 
 ولّد وأدر تضمينات المتجهات للبحث الدلالي.
 
-![Manage Embeddings](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-embedding.png)
+![Manage Embeddings](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-embedding_v2.png)
 
 ---
 

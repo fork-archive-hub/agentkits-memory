@@ -118,29 +118,35 @@ npx agentkits-memory-web
 
 Sau đó mở **http://localhost:1905** trong trình duyệt.
 
+### Danh sách Phiên
+
+Duyệt tất cả phiên làm việc với chế độ xem dòng thời gian và chi tiết hoạt động.
+
+![Session List](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-session-list_v2.png)
+
 ### Danh sách Bộ nhớ
 
 Duyệt tất cả bộ nhớ được lưu trữ với tìm kiếm và lọc namespace.
 
-![Memory List](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-list.png)
+![Memory List](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-list_v2.png)
 
 ### Thêm Bộ nhớ
 
 Tạo bộ nhớ mới với key, namespace, type, content và tags.
 
-![Add Memory](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-add-memory.png)
+![Add Memory](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-add-memory_v2.png)
 
 ### Chi tiết Bộ nhớ
 
 Xem chi tiết bộ nhớ đầy đủ với tùy chọn sửa và xóa.
 
-![Memory Detail](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-detail.png)
+![Memory Detail](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-memory-detail_v2.png)
 
 ### Quản lý Embeddings
 
 Tạo và quản lý vector embeddings cho tìm kiếm ngữ nghĩa.
 
-![Manage Embeddings](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-embedding.png)
+![Manage Embeddings](https://raw.githubusercontent.com/aitytech/agentkits-memory/main/assets/agentkits-memory-embedding_v2.png)
 
 ---
 
