@@ -1,0 +1,19 @@
+{
+  "name": "aitytech",
+  "owner": {
+    "name": "AityTech"
+  },
+  "metadata": {
+    "description": "AI agent tools by AityTech"
+  },
+  "plugins": [
+    {
+      "name": "agentkits-memory",
+      "source": "./plugin",
+      "description": "Persistent memory system for AI coding assistants — decisions, patterns, errors, and context across sessions",
+      "version": "2.2.0",
+      "category": "productivity",
+      "tags": ["memory", "context", "persistence", "mcp"]
+    }
+  ]
+}

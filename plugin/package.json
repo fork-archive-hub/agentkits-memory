@@ -1,0 +1,9 @@
+{
+  "name": "agentkits-memory-plugin",
+  "version": "2.2.0",
+  "private": true,
+  "description": "Runtime configuration for AgentKits Memory plugin",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
