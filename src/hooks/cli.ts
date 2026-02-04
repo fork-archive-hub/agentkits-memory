@@ -114,9 +114,13 @@ async function main(): Promise<void> {
       const cleanup = async () => { try { await svc.shutdown(); } catch {} process.exit(0); };
       process.on('SIGTERM', cleanup);
       process.on('SIGINT', cleanup);
+      // Safety: self-terminate after 5 minutes to prevent zombie processes
+      const killTimer = setTimeout(() => { cleanup(); }, 5 * 60 * 1000);
+      killTimer.unref();
       try {
         await svc.processEmbeddingQueue();
       } finally {
+        clearTimeout(killTimer);
         await svc.shutdown();
       }
       process.exit(0);
@@ -133,9 +137,13 @@ async function main(): Promise<void> {
       const cleanup = async () => { try { await svc.shutdown(); } catch {} process.exit(0); };
       process.on('SIGTERM', cleanup);
       process.on('SIGINT', cleanup);
+      // Safety: self-terminate after 5 minutes to prevent zombie processes
+      const killTimer = setTimeout(() => { cleanup(); }, 5 * 60 * 1000);
+      killTimer.unref();
       try {
         await svc.processEnrichmentQueue();
       } finally {
+        clearTimeout(killTimer);
         await svc.shutdown();
       }
       process.exit(0);
@@ -151,9 +159,13 @@ async function main(): Promise<void> {
       const cleanup = async () => { try { await svc.shutdown(); } catch {} process.exit(0); };
       process.on('SIGTERM', cleanup);
       process.on('SIGINT', cleanup);
+      // Safety: self-terminate after 5 minutes to prevent zombie processes
+      const killTimer = setTimeout(() => { cleanup(); }, 5 * 60 * 1000);
+      killTimer.unref();
       try {
         await svc.processCompressionQueue();
       } finally {
+        clearTimeout(killTimer);
         await svc.shutdown();
       }
       process.exit(0);

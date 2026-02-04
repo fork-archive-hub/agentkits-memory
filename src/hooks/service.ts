@@ -599,6 +599,8 @@ export class MemoryHookService {
 
   /** Max records to process per worker invocation */
   private static readonly WORKER_BATCH_LIMIT = 200;
+  /** Max retries before marking a task as permanently failed */
+  private static readonly MAX_TASK_RETRIES = 3;
 
   /**
    * Queue a background task. Inserts into SQLite task_queue — atomic, <1ms.
@@ -704,8 +706,8 @@ export class MemoryHookService {
       // Atomic claim: SELECT + UPDATE in a single transaction to prevent race conditions
       const claimEmbedTask = this.db!.transaction(() => {
         const item = this.db!.prepare(
-          "SELECT id, target_table, target_id FROM task_queue WHERE task_type = 'embed' AND status = 'pending' ORDER BY id ASC LIMIT 1"
-        ).get() as { id: number; target_table: string; target_id: string } | undefined;
+          "SELECT id, target_table, target_id, retry_count FROM task_queue WHERE task_type = 'embed' AND status = 'pending' AND retry_count < ? ORDER BY id ASC LIMIT 1"
+        ).get(MemoryHookService.MAX_TASK_RETRIES) as { id: number; target_table: string; target_id: string; retry_count: number } | undefined;
         if (item) {
           this.db!.prepare("UPDATE task_queue SET status = 'processing' WHERE id = ?").run(item.id);
         }
@@ -748,8 +750,14 @@ export class MemoryHookService {
           this.db!.prepare('DELETE FROM task_queue WHERE id = ?').run(item.id);
           count++;
         } catch {
-          this.db!.prepare("UPDATE task_queue SET status = 'pending' WHERE id = ?").run(item.id);
-          count++; // Still count failed attempts to prevent infinite loop on permanently failing tasks
+          // Increment retry_count; mark as 'failed' if max retries exceeded
+          const newRetry = (item.retry_count || 0) + 1;
+          if (newRetry >= MemoryHookService.MAX_TASK_RETRIES) {
+            this.db!.prepare("UPDATE task_queue SET status = 'failed', retry_count = ? WHERE id = ?").run(newRetry, item.id);
+          } else {
+            this.db!.prepare("UPDATE task_queue SET status = 'pending', retry_count = ? WHERE id = ?").run(newRetry, item.id);
+          }
+          count++;
         }
       }
 
@@ -802,8 +810,8 @@ export class MemoryHookService {
       // Atomic claim: SELECT + UPDATE in a single transaction to prevent race conditions
       const claimEnrichTask = this.db!.transaction(() => {
         const item = this.db!.prepare(
-          "SELECT id, target_table, target_id FROM task_queue WHERE task_type = 'enrich' AND status = 'pending' ORDER BY id ASC LIMIT 1"
-        ).get() as { id: number; target_table: string; target_id: string } | undefined;
+          "SELECT id, target_table, target_id, retry_count FROM task_queue WHERE task_type = 'enrich' AND status = 'pending' AND retry_count < ? ORDER BY id ASC LIMIT 1"
+        ).get(MemoryHookService.MAX_TASK_RETRIES) as { id: number; target_table: string; target_id: string; retry_count: number } | undefined;
         if (item) {
           this.db!.prepare("UPDATE task_queue SET status = 'processing' WHERE id = ?").run(item.id);
         }
@@ -825,8 +833,13 @@ export class MemoryHookService {
           this.db!.prepare('DELETE FROM task_queue WHERE id = ?').run(item.id);
           count++;
         } catch {
-          this.db!.prepare("UPDATE task_queue SET status = 'pending' WHERE id = ?").run(item.id);
-          count++; // Still count failed attempts to prevent infinite loop on permanently failing tasks
+          const newRetry = (item.retry_count || 0) + 1;
+          if (newRetry >= MemoryHookService.MAX_TASK_RETRIES) {
+            this.db!.prepare("UPDATE task_queue SET status = 'failed', retry_count = ? WHERE id = ?").run(newRetry, item.id);
+          } else {
+            this.db!.prepare("UPDATE task_queue SET status = 'pending', retry_count = ? WHERE id = ?").run(newRetry, item.id);
+          }
+          count++;
         }
       }
     } finally {
@@ -852,8 +865,8 @@ export class MemoryHookService {
       // Atomic claim: SELECT + UPDATE in a single transaction
       const claimCompressTask = this.db!.transaction(() => {
         const item = this.db!.prepare(
-          "SELECT id, target_table, target_id FROM task_queue WHERE task_type = 'compress' AND status = 'pending' ORDER BY id ASC LIMIT 1"
-        ).get() as { id: number; target_table: string; target_id: string } | undefined;
+          "SELECT id, target_table, target_id, retry_count FROM task_queue WHERE task_type = 'compress' AND status = 'pending' AND retry_count < ? ORDER BY id ASC LIMIT 1"
+        ).get(MemoryHookService.MAX_TASK_RETRIES) as { id: number; target_table: string; target_id: string; retry_count: number } | undefined;
         if (item) {
           this.db!.prepare("UPDATE task_queue SET status = 'processing' WHERE id = ?").run(item.id);
         }
@@ -875,7 +888,12 @@ export class MemoryHookService {
           this.db!.prepare('DELETE FROM task_queue WHERE id = ?').run(item.id);
           count++;
         } catch {
-          this.db!.prepare("UPDATE task_queue SET status = 'pending' WHERE id = ?").run(item.id);
+          const newRetry = (item.retry_count || 0) + 1;
+          if (newRetry >= MemoryHookService.MAX_TASK_RETRIES) {
+            this.db!.prepare("UPDATE task_queue SET status = 'failed', retry_count = ? WHERE id = ?").run(newRetry, item.id);
+          } else {
+            this.db!.prepare("UPDATE task_queue SET status = 'pending', retry_count = ? WHERE id = ?").run(newRetry, item.id);
+          }
           count++;
         }
       }
@@ -1823,7 +1841,8 @@ export class MemoryHookService {
         target_table TEXT NOT NULL,
         target_id TEXT NOT NULL,
         created_at INTEGER NOT NULL,
-        status TEXT DEFAULT 'pending'
+        status TEXT DEFAULT 'pending',
+        retry_count INTEGER DEFAULT 0
       )
     `);
 
@@ -1912,6 +1931,14 @@ export class MemoryHookService {
         }
         if (!summaryCols.some(c => c.name === 'errors')) {
           this.db.exec("ALTER TABLE session_summaries ADD COLUMN errors TEXT DEFAULT '[]'");
+        }
+      } catch { /* ignore */ }
+
+      // Migrate task_queue: add retry_count column
+      try {
+        const queueCols = this.db.prepare("PRAGMA table_info(task_queue)").all() as Array<{ name: string }>;
+        if (!queueCols.some(c => c.name === 'retry_count')) {
+          this.db.exec('ALTER TABLE task_queue ADD COLUMN retry_count INTEGER DEFAULT 0');
         }
       } catch { /* ignore */ }
 

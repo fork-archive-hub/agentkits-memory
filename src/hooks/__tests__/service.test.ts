@@ -915,6 +915,90 @@ describe('MemoryHookService', () => {
     });
   });
 
+  describe('task queue retry limits', () => {
+    const originalEnv = process.env.AGENTKITS_AI_ENRICHMENT;
+
+    beforeEach(() => {
+      delete process.env.AGENTKITS_AI_ENRICHMENT;
+      resetAIEnrichmentCache();
+    });
+
+    afterEach(() => {
+      _setRunClaudePrintMockForTesting(null);
+      resetAIEnrichmentCache();
+      if (originalEnv === undefined) {
+        delete process.env.AGENTKITS_AI_ENRICHMENT;
+      } else {
+        process.env.AGENTKITS_AI_ENRICHMENT = originalEnv;
+      }
+    });
+
+    it('should skip tasks that have reached max retries', async () => {
+      await service.initSession('session-1', 'test-project');
+      const obs = await service.storeObservation(
+        'session-1', 'test-project', 'Read', { file_path: 'test.ts' }, {}, TEST_DIR
+      );
+
+      // Queue a compress task and set retry_count to 3 (max)
+      service.queueTask('compress', 'observations', obs.id);
+      service.db.prepare("UPDATE task_queue SET retry_count = 3 WHERE task_type = 'compress'").run();
+
+      _setRunClaudePrintMockForTesting(() =>
+        JSON.stringify({ compressed_summary: 'Should not run' })
+      );
+
+      const count = await service.processCompressionQueue();
+      expect(count).toBe(0); // Skipped — retry limit reached
+
+      // Task should still be in queue as pending with retry_count=3
+      const task = service.db.prepare("SELECT * FROM task_queue WHERE task_type = 'compress'").get() as Record<string, unknown>;
+      expect(task.status).toBe('pending');
+      expect(task.retry_count).toBe(3);
+    });
+
+    it('should increment retry_count on failure and mark failed at max', async () => {
+      await service.initSession('session-1', 'test-project');
+
+      // Queue a compress task for observations table
+      service.db.prepare(
+        "INSERT INTO task_queue (task_type, target_table, target_id, created_at) VALUES ('compress', 'observations', 'bad-id', ?)"
+      ).run(Date.now());
+
+      // Monkey-patch compressObservation to throw (simulating unhandled error)
+      const origCompress = service.compressObservation.bind(service);
+      service.compressObservation = async () => { throw new Error('unexpected failure'); };
+
+      // Worker loop retries within a single call — all 3 attempts exhaust in one run
+      const count = await service.processCompressionQueue();
+      expect(count).toBe(3); // 3 failed attempts processed
+
+      // Task should now be marked 'failed' with retry_count=3
+      const task = service.db.prepare("SELECT * FROM task_queue WHERE task_type = 'compress'").get() as Record<string, unknown>;
+      expect(task.status).toBe('failed');
+      expect(task.retry_count).toBe(3);
+
+      // Next call skips entirely — no pending tasks under retry limit
+      const count2 = await service.processCompressionQueue();
+      expect(count2).toBe(0);
+
+      // Restore
+      service.compressObservation = origCompress;
+    });
+
+    it('should include retry_count column in task_queue schema', async () => {
+      await service.initialize();
+      const cols = service.db.prepare("PRAGMA table_info(task_queue)").all() as Array<{ name: string }>;
+      expect(cols.some(c => c.name === 'retry_count')).toBe(true);
+    });
+
+    it('should default retry_count to 0 for new tasks', async () => {
+      await service.initSession('session-1', 'test-project');
+      service.queueTask('embed', 'observations', 'test-id');
+      const task = service.db.prepare("SELECT retry_count FROM task_queue WHERE task_type = 'embed'").get() as Record<string, unknown>;
+      expect(task.retry_count).toBe(0);
+    });
+  });
+
   describe('computeContentHash', () => {
     it('should produce consistent hashes', () => {
       const hash1 = computeContentHash('a', 'b', 'c');
