@@ -7,12 +7,15 @@
  * @module @agentkits/memory/hooks/summarize
  */
 
+import { spawn } from 'node:child_process';
+import * as path from 'node:path';
 import {
   NormalizedHookInput,
   HookResult,
   EventHandler,
 } from './types.js';
 import { MemoryHookService } from './service.js';
+import { isAIEnrichmentEnabled } from './ai-enrichment.js';
 
 /**
  * Summarize Hook - Stop Event
@@ -56,11 +59,43 @@ export class SummarizeHook implements EventHandler {
         };
       }
 
-      // Generate summary from observations
-      const summary = await this.service.generateSummary(input.sessionId);
+      // Generate structured summary from observations + prompts
+      const structured = await this.service.generateStructuredSummary(input.sessionId);
 
-      // Complete the session with summary
-      await this.service.completeSession(input.sessionId, summary);
+      // Save structured summary to session_summaries table (same DB as memories)
+      await this.service.saveSessionSummary(structured);
+
+      // Complete the session with text summary (legacy field)
+      const textSummary = await this.service.generateSummary(input.sessionId);
+      await this.service.completeSession(input.sessionId, textSummary);
+
+      // Spawn background workers to process queued tasks (one per type, gated by lock file)
+      this.service.ensureWorkerRunning(input.cwd, 'embed-session', 'embed-worker.lock');
+      if (isAIEnrichmentEnabled()) {
+        this.service.ensureWorkerRunning(input.cwd, 'enrich-session', 'enrich-worker.lock');
+
+        // Queue compression for this session's observations (runs after enrichment)
+        this.service.queueTask('compress', 'sessions', input.sessionId);
+        this.service.ensureWorkerRunning(input.cwd, 'compress-session', 'compress-worker.lock');
+      }
+
+      // Summary enrichment needs transcript path — handled separately (not via queue)
+      if (isAIEnrichmentEnabled() && input.transcriptPath) {
+        try {
+          const cliPath = path.resolve(input.cwd, 'dist/hooks/cli.js');
+          const child = spawn('node', [
+            cliPath, 'enrich-summary', input.sessionId, input.cwd, input.transcriptPath,
+          ], {
+            detached: true,
+            stdio: 'ignore',
+            env: { ...process.env },
+          });
+          child.on('error', () => { /* spawn failure — silently ignore */ });
+          child.unref();
+        } catch {
+          // Silently ignore
+        }
+      }
 
       // Shutdown service
       await this.service.shutdown();

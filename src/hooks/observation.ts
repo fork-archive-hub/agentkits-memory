@@ -15,13 +15,28 @@ import {
 import { MemoryHookService } from './service.js';
 
 /**
- * Tools to skip capturing (internal/noisy tools)
+ * Tools to skip capturing (internal/noisy tools).
+ * Includes our own memory MCP tools to avoid self-referential loops.
  */
 const SKIP_TOOLS = new Set([
   'TodoWrite',
   'TodoRead',
   'AskFollowupQuestion',
+  'AskUserQuestion',
   'AttemptCompletion',
+  // Low-signal tools (directory listings add noise)
+  'LS',
+  // Skip our own memory tools (avoid capturing memory ops as observations)
+  'mcp__memory__memory_save',
+  'mcp__memory__memory_search',
+  'mcp__memory__memory_timeline',
+  'mcp__memory__memory_details',
+  'mcp__memory__memory_delete',
+  'mcp__memory__memory_update',
+  'mcp__memory__memory_recall',
+  'mcp__memory__memory_list',
+  'mcp__memory__memory_status',
+  'mcp__memory____IMPORTANT',
 ]);
 
 /**
@@ -69,14 +84,24 @@ export class ObservationHook implements EventHandler {
         };
       }
 
+      // Skip empty/no-op tool calls (e.g. Read with no file_path)
+      const inputStr = JSON.stringify(input.toolInput || {});
+      const responseStr = JSON.stringify(input.toolResponse || {});
+      if (inputStr === '{}' && responseStr === '{}') {
+        return {
+          continue: true,
+          suppressOutput: true,
+        };
+      }
+
       // Initialize service
       await this.service.initialize();
 
       // Ensure session exists (create if not)
       await this.service.initSession(input.sessionId, input.project);
 
-      // Store the observation
-      await this.service.storeObservation(
+      // Store the observation (template-based, fast <50ms)
+      const obs = await this.service.storeObservation(
         input.sessionId,
         input.project,
         input.toolName,
@@ -84,6 +109,9 @@ export class ObservationHook implements EventHandler {
         input.toolResponse,
         input.cwd
       );
+
+      // Enrichment + embedding are queued in service.ts storeObservation()
+      // Workers are spawned at session end (summarize hook)
 
       return {
         continue: true,

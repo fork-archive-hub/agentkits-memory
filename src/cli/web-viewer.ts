@@ -45,12 +45,116 @@ let _searchEngine: HybridSearchEngine | null = null;
 let _db: BetterDatabase | null = null;
 
 /**
- * Get direct database access
+ * Get direct database access (memory.db)
  */
 function getDatabase(): BetterDatabase {
   if (_db) return _db;
   _db = new Database(dbPath);
   _db.pragma('journal_mode = WAL');
+
+  // Ensure all tables exist (web viewer may start before MCP server or hooks)
+  _db.exec(`
+    CREATE TABLE IF NOT EXISTS memory_entries (
+      id TEXT PRIMARY KEY,
+      key TEXT NOT NULL,
+      content TEXT NOT NULL,
+      type TEXT DEFAULT 'semantic',
+      namespace TEXT DEFAULT 'default',
+      tags TEXT DEFAULT '[]',
+      metadata TEXT DEFAULT '{}',
+      embedding BLOB,
+      session_id TEXT,
+      owner_id TEXT,
+      access_level TEXT DEFAULT 'project',
+      created_at INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000),
+      updated_at INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000),
+      expires_at INTEGER,
+      version INTEGER DEFAULT 1,
+      "references" TEXT DEFAULT '[]',
+      access_count INTEGER DEFAULT 0,
+      last_accessed_at INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000)
+    );
+    CREATE TABLE IF NOT EXISTS sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT UNIQUE NOT NULL,
+      project TEXT NOT NULL,
+      prompt TEXT,
+      started_at INTEGER NOT NULL,
+      ended_at INTEGER,
+      observation_count INTEGER DEFAULT 0,
+      summary TEXT,
+      status TEXT DEFAULT 'active'
+    );
+    CREATE TABLE IF NOT EXISTS observations (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      project TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      tool_input TEXT,
+      tool_response TEXT,
+      cwd TEXT,
+      timestamp INTEGER NOT NULL,
+      type TEXT,
+      title TEXT,
+      prompt_number INTEGER,
+      files_read TEXT DEFAULT '[]',
+      files_modified TEXT DEFAULT '[]',
+      subtitle TEXT,
+      narrative TEXT,
+      facts TEXT DEFAULT '[]',
+      concepts TEXT DEFAULT '[]',
+      embedding BLOB,
+      FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+    );
+    CREATE TABLE IF NOT EXISTS user_prompts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      prompt_number INTEGER NOT NULL,
+      prompt_text TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      embedding BLOB,
+      UNIQUE(session_id, prompt_number),
+      FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+    );
+    CREATE TABLE IF NOT EXISTS session_summaries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      project TEXT NOT NULL,
+      request TEXT,
+      completed TEXT,
+      files_read TEXT DEFAULT '[]',
+      files_modified TEXT DEFAULT '[]',
+      next_steps TEXT,
+      notes TEXT,
+      prompt_number INTEGER,
+      created_at INTEGER NOT NULL,
+      embedding BLOB,
+      FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+    );
+  `);
+
+  // Task queue table (shared with hooks service — used for embed + enrich workers)
+  _db.exec(`
+    CREATE TABLE IF NOT EXISTS task_queue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_type TEXT NOT NULL,
+      target_table TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      status TEXT DEFAULT 'pending'
+    )
+  `);
+
+  // Migration: add embedding column to existing session tables
+  for (const table of ['observations', 'user_prompts', 'session_summaries']) {
+    try {
+      const cols = _db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      if (!cols.some(c => c.name === 'embedding')) {
+        _db.exec(`ALTER TABLE ${table} ADD COLUMN embedding BLOB`);
+      }
+    } catch { /* ignore */ }
+  }
+
   return _db;
 }
 
@@ -85,6 +189,196 @@ async function getSearchEngine(): Promise<HybridSearchEngine> {
   _searchEngine = new HybridSearchEngine(db, {}, embeddingGenerator);
   await _searchEngine.initialize();
   return _searchEngine;
+}
+
+// ===== Session Hybrid Search =====
+
+/**
+ * Cosine similarity between two Float32Arrays
+ */
+function cosineSimilarity(a: Float32Array, b: Float32Array): number {
+  if (a.length !== b.length) return 0;
+  let dot = 0, normA = 0, normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(normA) * Math.sqrt(normB);
+  return denom === 0 ? 0 : dot / denom;
+}
+
+/**
+ * Extract text to embed for a session table row
+ */
+function getSessionEmbeddingText(
+  table: 'observations' | 'user_prompts' | 'session_summaries',
+  row: Record<string, unknown>
+): string {
+  switch (table) {
+    case 'observations': {
+      const parts = [row.title, row.subtitle, row.narrative];
+      try {
+        const concepts = JSON.parse((row.concepts as string) || '[]');
+        if (concepts.length > 0) parts.push(concepts.join(', '));
+      } catch { /* ignore */ }
+      return parts.filter(Boolean).join(' ').trim();
+    }
+    case 'user_prompts':
+      return ((row.prompt_text as string) || '').trim();
+    case 'session_summaries': {
+      const parts = [row.request, row.completed, row.next_steps, row.notes];
+      return parts.filter(Boolean).join(' ').trim();
+    }
+  }
+}
+
+interface SessionSearchResult {
+  table: 'observations' | 'user_prompts' | 'session_summaries';
+  id: string | number;
+  sessionId: string;
+  score: number;
+  keywordScore: number;
+  semanticScore: number;
+  time: number;
+  snippet: string;
+  data: Record<string, unknown>;
+}
+
+/**
+ * Hybrid search across all session tables (text + vector)
+ */
+async function searchSessionsHybrid(
+  db: BetterDatabase,
+  query: string,
+  options: { type?: 'hybrid' | 'text' | 'vector'; limit?: number } = {}
+): Promise<SessionSearchResult[]> {
+  const { type = 'hybrid', limit = 30 } = options;
+  const results = new Map<string, SessionSearchResult>();
+  const queryLower = query.toLowerCase();
+
+  // === Text search (LIKE) ===
+  if (type === 'hybrid' || type === 'text') {
+    const pattern = `%${query}%`;
+
+    // Observations
+    const obs = db.prepare(`
+      SELECT * FROM observations
+      WHERE title LIKE ? OR subtitle LIKE ? OR narrative LIKE ? OR tool_name LIKE ?
+      ORDER BY timestamp DESC LIMIT ?
+    `).all(pattern, pattern, pattern, pattern, limit) as Record<string, unknown>[];
+    for (const row of obs) {
+      const text = getSessionEmbeddingText('observations', row);
+      const idx = text.toLowerCase().indexOf(queryLower);
+      const kwScore = idx >= 0 ? Math.max(0.3, 1 - idx / 500) : 0.3;
+      results.set(`obs_${row.id}`, {
+        table: 'observations', id: row.id as string, sessionId: row.session_id as string,
+        score: type === 'text' ? kwScore : kwScore * 0.3,
+        keywordScore: kwScore, semanticScore: 0,
+        time: row.timestamp as number,
+        snippet: text.substring(0, 120),
+        data: { ...row, embedding: undefined },
+      });
+    }
+
+    // User prompts
+    const prompts = db.prepare(`
+      SELECT * FROM user_prompts WHERE prompt_text LIKE ?
+      ORDER BY created_at DESC LIMIT ?
+    `).all(pattern, limit) as Record<string, unknown>[];
+    for (const row of prompts) {
+      const text = (row.prompt_text as string) || '';
+      const idx = text.toLowerCase().indexOf(queryLower);
+      const kwScore = idx >= 0 ? Math.max(0.3, 1 - idx / 500) : 0.3;
+      results.set(`prompt_${row.id}`, {
+        table: 'user_prompts', id: row.id as number, sessionId: row.session_id as string,
+        score: type === 'text' ? kwScore : kwScore * 0.3,
+        keywordScore: kwScore, semanticScore: 0,
+        time: row.created_at as number,
+        snippet: text.substring(0, 120),
+        data: { ...row, embedding: undefined },
+      });
+    }
+
+    // Session summaries
+    const summaries = db.prepare(`
+      SELECT * FROM session_summaries
+      WHERE request LIKE ? OR completed LIKE ? OR notes LIKE ? OR next_steps LIKE ?
+      ORDER BY created_at DESC LIMIT ?
+    `).all(pattern, pattern, pattern, pattern, limit) as Record<string, unknown>[];
+    for (const row of summaries) {
+      const text = getSessionEmbeddingText('session_summaries', row);
+      const idx = text.toLowerCase().indexOf(queryLower);
+      const kwScore = idx >= 0 ? Math.max(0.3, 1 - idx / 500) : 0.3;
+      results.set(`summary_${row.id}`, {
+        table: 'session_summaries', id: row.id as number, sessionId: row.session_id as string,
+        score: type === 'text' ? kwScore : kwScore * 0.3,
+        keywordScore: kwScore, semanticScore: 0,
+        time: row.created_at as number,
+        snippet: text.substring(0, 120),
+        data: { ...row, embedding: undefined },
+      });
+    }
+  }
+
+  // === Vector search ===
+  if ((type === 'hybrid' || type === 'vector') && query.trim()) {
+    try {
+      const embeddingsService = await getEmbeddingsService();
+      const queryResult = await embeddingsService.embed(query);
+      const queryEmbedding = queryResult.embedding;
+
+      const tables: Array<{ name: 'observations' | 'user_prompts' | 'session_summaries'; idCol: string; timeCol: string }> = [
+        { name: 'observations', idCol: 'id', timeCol: 'timestamp' },
+        { name: 'user_prompts', idCol: 'id', timeCol: 'created_at' },
+        { name: 'session_summaries', idCol: 'id', timeCol: 'created_at' },
+      ];
+
+      for (const { name, idCol, timeCol } of tables) {
+        const rows = db.prepare(
+          `SELECT * FROM ${name} WHERE embedding IS NOT NULL AND LENGTH(embedding) > 0 ORDER BY ${timeCol} DESC LIMIT 2000`
+        ).all() as Record<string, unknown>[];
+
+        for (const row of rows) {
+          const embBuffer = row.embedding as Buffer;
+          if (!embBuffer || embBuffer.length === 0) continue;
+          const embedding = new Float32Array(
+            embBuffer.buffer.slice(embBuffer.byteOffset, embBuffer.byteOffset + embBuffer.byteLength)
+          );
+          const sim = cosineSimilarity(queryEmbedding, embedding);
+          if (sim < 0.1) continue;
+
+          const prefix = name === 'observations' ? 'obs' : name === 'user_prompts' ? 'prompt' : 'summary';
+          const key = `${prefix}_${row[idCol]}`;
+          const existing = results.get(key);
+
+          if (existing) {
+            existing.semanticScore = sim;
+            existing.score = existing.keywordScore * 0.3 + sim * 0.7;
+          } else {
+            const text = getSessionEmbeddingText(name, row);
+            results.set(key, {
+              table: name,
+              id: row[idCol] as string | number,
+              sessionId: row.session_id as string,
+              score: type === 'vector' ? sim : sim * 0.7,
+              keywordScore: 0, semanticScore: sim,
+              time: row[timeCol] as number,
+              snippet: text.substring(0, 120),
+              data: { ...row, embedding: undefined },
+            });
+          }
+        }
+      }
+    } catch {
+      // Embeddings not available, fall back to text-only results
+    }
+  }
+
+  return Array.from(results.values())
+    .filter(r => r.score >= 0.05)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
 }
 
 /**
@@ -984,7 +1278,17 @@ function getHTML(): string {
           <p class="subtitle">AgentKits Memory Database</p>
         </div>
       </div>
-      <div class="header-actions">
+      <div class="header-actions" id="header-actions-sessions">
+        <button class="btn" onclick="generateSessionEmbeddings('missing')">
+          <svg viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
+          Generate Embeddings
+        </button>
+        <button class="btn" onclick="loadSessions()">
+          <svg viewBox="0 0 24 24"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+          Refresh
+        </button>
+      </div>
+      <div class="header-actions" id="header-actions-memories" style="display:none;">
         <button class="btn btn-primary" onclick="openAddModal()">
           <svg viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
           Add Memory
@@ -1000,6 +1304,46 @@ function getHTML(): string {
       </div>
     </header>
 
+    <!-- Tab Navigation -->
+    <div class="tab-nav" style="display:flex;gap:4px;margin-bottom:24px;border-bottom:1px solid var(--border);padding-bottom:0;">
+      <button class="tab-btn active" onclick="switchTab('sessions')" id="tab-sessions"
+        style="padding:10px 20px;background:none;border:none;color:var(--text-primary);cursor:pointer;border-bottom:2px solid var(--accent);font-size:14px;font-weight:500;">
+        <svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;vertical-align:-2px;margin-right:6px;"><path d="M13 3c-4.97 0-9 4.03-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42C8.27 19.99 10.51 21 13 21c4.97 0 9-4.03 9-9s-4.03-9-9-9zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"/></svg>
+        Sessions
+      </button>
+      <button class="tab-btn" onclick="switchTab('memories')" id="tab-memories"
+        style="padding:10px 20px;background:none;border:none;color:var(--text-secondary);cursor:pointer;border-bottom:2px solid transparent;font-size:14px;font-weight:500;">
+        <svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:currentColor;vertical-align:-2px;margin-right:6px;"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+        Memories
+      </button>
+    </div>
+
+    <!-- Sessions Tab -->
+    <div id="sessions-tab">
+      <div class="stats-grid" id="sessions-stats"></div>
+      <div class="controls">
+        <div class="search-box">
+          <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+          <input type="text" id="session-search-input" placeholder="Search sessions, prompts, observations..." oninput="debounceSessionSearch()">
+        </div>
+        <select id="session-search-type" class="search-type-select" onchange="debounceSessionSearch()">
+          <option value="hybrid">Hybrid (Text + Semantic)</option>
+          <option value="text">Text Only</option>
+          <option value="vector">Semantic Only (Vector)</option>
+        </select>
+      </div>
+      <div id="session-embedding-bar" style="display:flex;align-items:center;gap:16px;margin-bottom:16px;padding:10px 16px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;font-size:13px;">
+        <svg viewBox="0 0 24 24" style="width:16px;height:16px;fill:var(--accent);flex-shrink:0;"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
+        <span id="session-emb-stats" style="color:var(--text-secondary);flex:1;">Vector index: loading...</span>
+      </div>
+      <div id="sessions-feed" class="entries-list">
+        <div style="text-align:center;color:var(--text-secondary);padding:40px;">Loading sessions...</div>
+      </div>
+      <div id="session-pagination" class="pagination"></div>
+    </div>
+
+    <!-- Memories Tab -->
+    <div id="memories-tab" style="display:none;">
     <div id="stats-container" class="stats-grid"></div>
     <div id="namespace-pills" class="namespace-pills"></div>
 
@@ -1020,6 +1364,7 @@ function getHTML(): string {
     </div>
 
     <div id="pagination" class="pagination"></div>
+    </div><!-- /memories-tab -->
   </div>
 
   <!-- Detail Modal -->
@@ -1626,7 +1971,326 @@ function getHTML(): string {
       }
     });
 
-    loadData();
+    // Tab switching
+    function switchTab(tab) {
+      document.getElementById('memories-tab').style.display = tab === 'memories' ? '' : 'none';
+      document.getElementById('sessions-tab').style.display = tab === 'sessions' ? '' : 'none';
+      document.getElementById('header-actions-memories').style.display = tab === 'memories' ? '' : 'none';
+      document.getElementById('header-actions-sessions').style.display = tab === 'sessions' ? '' : 'none';
+
+      document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.style.borderBottomColor = 'transparent';
+        btn.style.color = 'var(--text-secondary)';
+      });
+      const activeBtn = document.getElementById('tab-' + tab);
+      activeBtn.style.borderBottomColor = 'var(--accent)';
+      activeBtn.style.color = 'var(--text-primary)';
+
+      if (tab === 'sessions') loadSessions();
+      if (tab === 'memories') loadData();
+    }
+
+    // Sessions search
+    let sessionSearchQuery = '';
+    let sessionSearchTimer = null;
+    function debounceSessionSearch() {
+      clearTimeout(sessionSearchTimer);
+      sessionSearchTimer = setTimeout(() => {
+        sessionSearchQuery = document.getElementById('session-search-input').value.trim();
+        loadSessions();
+      }, 300);
+    }
+
+    // Session embedding management
+    async function loadSessionEmbeddingStats() {
+      try {
+        const res = await fetch('/api/sessions/embeddings/stats');
+        const stats = await res.json();
+        const el = document.getElementById('session-emb-stats');
+        let totalAll = 0, totalWithEmb = 0;
+        const parts = [];
+        for (const [table, s] of Object.entries(stats)) {
+          const label = table === 'observations' ? 'Obs' : table === 'user_prompts' ? 'Prompts' : 'Summaries';
+          totalAll += s.total;
+          totalWithEmb += s.withEmbedding;
+          const missing = s.total - s.withEmbedding;
+          const badge = missing > 0
+            ? '<span style="color:var(--warning);font-weight:500;">' + s.withEmbedding + '/' + s.total + '</span>'
+            : '<span style="color:var(--success);">' + s.total + '</span>';
+          parts.push(label + ': ' + badge);
+        }
+        const missingTotal = totalAll - totalWithEmb;
+        const status = missingTotal > 0
+          ? '<span style="color:var(--warning);">' + missingTotal + ' missing</span>'
+          : '<span style="color:var(--success);">All indexed</span>';
+        el.innerHTML = 'Vector index: ' + parts.join(' &middot; ') + ' &mdash; ' + status;
+      } catch { /* ignore */ }
+    }
+
+    async function generateSessionEmbeddings(mode) {
+      const el = document.getElementById('session-emb-stats');
+      el.innerHTML = '<span style="color:var(--accent);">Generating embeddings...</span>';
+      try {
+        const res = await fetch('/api/sessions/embeddings/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode: mode || 'missing' }),
+        });
+        const result = await res.json();
+        if (typeof showToast === 'function') {
+          showToast(result.success + ' embeddings generated', 'success');
+        }
+        loadSessionEmbeddingStats();
+      } catch (err) {
+        el.innerHTML = '<span style="color:var(--error);">Error: ' + err.message + '</span>';
+      }
+    }
+
+    // Sessions feed with pagination
+    const sessionPageSize = 30;
+    let sessionPage = 0;
+
+    function sessionPrevPage() { if (sessionPage > 0) { sessionPage--; loadSessions(); } }
+    function sessionNextPage() { sessionPage++; loadSessions(); }
+
+    async function loadSessions() {
+      const feed = document.getElementById('sessions-feed');
+      const statsEl = document.getElementById('sessions-stats');
+      const paginationEl = document.getElementById('session-pagination');
+      loadSessionEmbeddingStats();
+
+      try {
+        let items = [];
+        let totalItems = 0;
+
+        if (sessionSearchQuery) {
+          // Use hybrid search endpoint (no pagination for search — returns ranked results)
+          const searchType = document.getElementById('session-search-type').value;
+          const params = new URLSearchParams({
+            q: sessionSearchQuery,
+            type: searchType,
+            limit: String(sessionPageSize),
+          });
+          const res = await fetch('/api/sessions/search?' + params);
+          const results = await res.json();
+
+          statsEl.innerHTML = \`
+            <div class="stat-card">
+              <div class="stat-label">Search Results</div>
+              <div class="stat-value">\${results.length}</div>
+            </div>
+          \`;
+
+          // Map search results to timeline items (already have hasEmbedding from data)
+          for (const r of results) {
+            const d = r.data || {};
+            const hasEmb = !!(d.hasEmbedding || (r.semanticScore && r.semanticScore > 0));
+            if (r.table === 'observations') {
+              items.push({
+                type: 'observation', time: r.time, sessionId: r.sessionId, score: r.score, hasEmbedding: hasEmb,
+                toolName: d.tool_name, title: d.title, obsType: d.type, promptNumber: d.prompt_number,
+                subtitle: d.subtitle, narrative: d.narrative,
+              });
+            } else if (r.table === 'user_prompts') {
+              items.push({
+                type: 'prompt', time: r.time, sessionId: r.sessionId, score: r.score, hasEmbedding: hasEmb,
+                promptNumber: d.prompt_number, text: d.prompt_text,
+              });
+            } else if (r.table === 'session_summaries') {
+              items.push({
+                type: 'summary', time: r.time, sessionId: r.sessionId, score: r.score, hasEmbedding: hasEmb,
+                request: d.request, completed: d.completed, filesModified: d.files_modified,
+                nextSteps: d.next_steps, notes: d.notes,
+              });
+            }
+          }
+          totalItems = results.length;
+          paginationEl.innerHTML = '';
+        } else {
+          // Browse mode with pagination
+          const offset = sessionPage * sessionPageSize;
+          const [sessRes, obsRes] = await Promise.all([
+            fetch('/api/sessions?limit=' + sessionPageSize + '&offset=' + offset),
+            fetch('/api/observations?limit=' + sessionPageSize + '&offset=' + offset)
+          ]);
+          const data = await sessRes.json();
+          const observations = await obsRes.json();
+
+          statsEl.innerHTML = \`
+            <div class="stat-card">
+              <div class="stat-label">Sessions</div>
+              <div class="stat-value">\${data.sessions?.length || 0}</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">User Prompts</div>
+              <div class="stat-value">\${data.prompts?.length || 0}</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Summaries</div>
+              <div class="stat-value">\${data.summaries?.length || 0}</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Observations</div>
+              <div class="stat-value">\${observations?.length || 0}</div>
+            </div>
+          \`;
+
+          for (const p of (data.prompts || [])) {
+            items.push({ type: 'prompt', time: p.created_at, sessionId: p.session_id,
+              promptNumber: p.prompt_number, text: p.prompt_text, project: p.project,
+              hasEmbedding: !!p.hasEmbedding });
+          }
+          for (const s of (data.summaries || [])) {
+            items.push({ type: 'summary', time: s.created_at, sessionId: s.session_id,
+              request: s.request, completed: s.completed, filesModified: s.files_modified,
+              nextSteps: s.next_steps, notes: s.notes, project: s.project,
+              hasEmbedding: !!s.hasEmbedding });
+          }
+          for (const o of observations) {
+            items.push({ type: 'observation', time: o.timestamp, sessionId: o.session_id,
+              toolName: o.tool_name, title: o.title, obsType: o.type, promptNumber: o.prompt_number,
+              subtitle: o.subtitle, narrative: o.narrative, concepts: o.concepts,
+              compressedSummary: o.compressed_summary, isCompressed: o.is_compressed,
+              hasEmbedding: !!o.hasEmbedding });
+          }
+          totalItems = items.length;
+
+          // Render pagination
+          const hasMore = observations.length === sessionPageSize || (data.prompts || []).length === sessionPageSize;
+          paginationEl.innerHTML = \`
+            <button class="btn" \${sessionPage <= 0 ? 'disabled' : ''} onclick="sessionPrevPage()">Previous</button>
+            <span style="color:var(--text-secondary);font-size:13px;">Page \${sessionPage + 1}</span>
+            <button class="btn" \${!hasMore ? 'disabled' : ''} onclick="sessionNextPage()">Next</button>
+          \`;
+        }
+
+        items.sort((a, b) => (b.time || 0) - (a.time || 0));
+
+        if (items.length === 0) {
+          feed.innerHTML = '<div style="text-align:center;color:var(--text-secondary);padding:40px;">' +
+            (sessionSearchQuery ? 'No results for "' + escapeHtml(sessionSearchQuery) + '"' : 'No session data yet. Hook data will appear here after sessions run.') + '</div>';
+          return;
+        }
+
+        feed.innerHTML = items.map(item => {
+          const time = new Date(item.time).toLocaleString();
+          const sid = (item.sessionId || '').substring(0, 8);
+          const scoreBadge = item.score !== undefined
+            ? '<span class="score-badge">' + (item.score * 100).toFixed(0) + '%</span>'
+            : '';
+          const vecBadge = item.hasEmbedding
+            ? '<span class="vector-badge has-vector" title="Vector indexed">Vec</span>'
+            : '<span class="vector-badge no-vector" title="Not indexed">--</span>';
+
+          if (item.type === 'prompt') {
+            const promptId = 'prompt_' + Math.random().toString(36).slice(2, 8);
+            const promptText = item.text || '';
+            const isLong = promptText.length > 200;
+            return \`<div class="entry-card" style="border-left:3px solid var(--accent);">
+              <div class="entry-header">
+                <span class="entry-type" style="background:#3B82F6;color:white;padding:2px 8px;border-radius:4px;font-size:11px;">PROMPT #\${item.promptNumber || '?'}</span>
+                <div class="entry-badges">\${scoreBadge}\${vecBadge}<span class="entry-meta">\${time} · \${sid}</span></div>
+              </div>
+              <div class="entry-content" style="margin-top:8px;white-space:pre-wrap;overflow:hidden;">
+                \${isLong ? '<span id="' + promptId + '_short">' + escapeHtml(truncate(promptText, 200)) + ' <a href="#" onclick="toggleExpand(\\'' + promptId + '\\');return false;" style="color:var(--accent);font-size:12px;">show more</a></span><span id="' + promptId + '_full" style="display:none;">' + escapeHtml(promptText) + ' <a href="#" onclick="toggleExpand(\\'' + promptId + '\\');return false;" style="color:var(--accent);font-size:12px;">show less</a></span>' : escapeHtml(promptText)}
+              </div>
+            </div>\`;
+          }
+
+          if (item.type === 'summary') {
+            const sumId = 'sum_' + Math.random().toString(36).slice(2, 8);
+            let filesStr = '';
+            try { filesStr = JSON.parse(item.filesModified || '[]').join(', '); } catch {}
+            const requestText = item.request || '';
+            const completedText = item.completed || '';
+            const isLong = requestText.length > 150 || completedText.length > 150 || filesStr.length > 150;
+            return \`<div class="entry-card" style="border-left:3px solid var(--success);">
+              <div class="entry-header">
+                <span class="entry-type" style="background:#22C55E;color:white;padding:2px 8px;border-radius:4px;font-size:11px;">SUMMARY</span>
+                <div class="entry-badges">\${scoreBadge}\${vecBadge}<span class="entry-meta">\${time} · \${sid}</span></div>
+              </div>
+              <div style="margin-top:8px;">
+                <span id="\${sumId}_short">
+                  \${requestText ? '<div><strong>Request:</strong> ' + escapeHtml(truncate(requestText, 150)) + '</div>' : ''}
+                  \${completedText ? '<div><strong>Completed:</strong> ' + escapeHtml(truncate(completedText, 150)) + '</div>' : ''}
+                  \${filesStr ? '<div><strong>Files:</strong> ' + escapeHtml(truncate(filesStr, 100)) + '</div>' : ''}
+                  \${isLong ? '<a href="#" onclick="toggleExpand(\\'' + sumId + '\\');return false;" style="color:var(--accent);font-size:12px;">show more</a>' : ''}
+                </span>
+                <span id="\${sumId}_full" style="display:none;">
+                  \${requestText ? '<div><strong>Request:</strong> ' + escapeHtml(requestText) + '</div>' : ''}
+                  \${completedText ? '<div><strong>Completed:</strong> ' + escapeHtml(completedText) + '</div>' : ''}
+                  \${filesStr ? '<div><strong>Files:</strong> ' + escapeHtml(filesStr) + '</div>' : ''}
+                  \${item.nextSteps ? '<div><strong>Next:</strong> ' + escapeHtml(item.nextSteps) + '</div>' : ''}
+                  \${item.notes ? '<div><strong>Notes:</strong> ' + escapeHtml(item.notes) + '</div>' : ''}
+                  <a href="#" onclick="toggleExpand(\\'' + sumId + '\\');return false;" style="color:var(--accent);font-size:12px;">show less</a>
+                </span>
+              </div>
+            </div>\`;
+          }
+
+          // observation
+          const icons = {
+            read: '<svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:var(--accent);vertical-align:-2px;"><path d="M21 5c-1.11-.35-2.33-.5-3.5-.5-1.95 0-4.05.4-5.5 1.5-1.45-1.1-3.55-1.5-5.5-1.5S2.45 4.9 1 6v14.65c0 .25.25.5.5.5.1 0 .15-.05.25-.05C3.1 20.45 5.05 20 6.5 20c1.95 0 4.05.4 5.5 1.5 1.35-.85 3.8-1.5 5.5-1.5 1.65 0 3.35.3 4.75 1.05.1.05.15.05.25.05.25 0 .5-.25.5-.5V6c-.6-.45-1.25-.75-2-1zm0 13.5c-1.1-.35-2.3-.5-3.5-.5-1.7 0-4.15.65-5.5 1.5V8c1.35-.85 3.8-1.5 5.5-1.5 1.2 0 2.4.15 3.5.5v11.5z"/></svg>',
+            write: '<svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:var(--warning);vertical-align:-2px;"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>',
+            execute: '<svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:var(--success);vertical-align:-2px;"><path d="M9.4 16.6L4.8 12l4.6-4.6L8 6l-6 6 6 6 1.4-1.4zm5.2 0l4.6-4.6-4.6-4.6L16 6l6 6-6 6-1.4-1.4z"/></svg>',
+            search: '<svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:#8B5CF6;vertical-align:-2px;"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>'
+          };
+          const icon = icons[item.obsType] || '<svg viewBox="0 0 24 24" style="width:14px;height:14px;fill:var(--text-muted);vertical-align:-2px;"><circle cx="12" cy="12" r="4"/></svg>';
+          const titleText = item.compressedSummary || item.title || '';
+          const subtitleText = item.subtitle ? escapeHtml(item.subtitle) : '';
+          const narrativeText = item.narrative ? escapeHtml(item.narrative) : '';
+          let intentBadges = '';
+          try {
+            const concepts = JSON.parse(item.concepts || '[]');
+            const intents = concepts.filter(c => c.startsWith('intent:')).map(c => c.slice(7));
+            if (intents.length > 0) intentBadges = ' <span style="font-size:11px;color:var(--warning);opacity:0.8;">[' + intents.join(', ') + ']</span>';
+          } catch {}
+          const hasDetails = subtitleText || narrativeText;
+          const obsId = 'obs_' + Math.random().toString(36).slice(2, 8);
+          return \`<div class="entry-card" style="border-left:3px solid var(--border);padding:12px 16px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;\${hasDetails ? 'cursor:pointer;' : ''}" \${hasDetails ? 'onclick="toggleObsDetail(\\'' + obsId + '\\')"' : ''}>
+              <span style="flex:1;min-width:0;">\${icon} <strong>\${escapeHtml(item.toolName || '')}</strong> \${escapeHtml(titleText)}\${intentBadges}\${scoreBadge}</span>
+              <span style="color:var(--text-muted);font-size:12px;white-space:nowrap;">\${vecBadge} \${time}\${item.promptNumber ? ' · P#' + item.promptNumber : ''}\${item.isCompressed ? ' · <span style="color:var(--success);">Z</span>' : ''}</span>
+            </div>
+            \${hasDetails ? '<div id="' + obsId + '" style="display:none;margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:13px;color:var(--text-secondary);">' +
+              (subtitleText ? '<div>' + subtitleText + '</div>' : '') +
+              (narrativeText ? '<div style="margin-top:4px;font-style:italic;">' + narrativeText + '</div>' : '') +
+            '</div>' : ''}
+          </div>\`;
+        }).join('');
+
+      } catch (err) {
+        feed.innerHTML = '<div style="text-align:center;color:var(--error);padding:40px;">Error loading sessions: ' + err.message + '</div>';
+      }
+    }
+
+    function toggleObsDetail(id) {
+      const el = document.getElementById(id);
+      if (el) el.style.display = el.style.display === 'none' ? '' : 'none';
+    }
+
+    function toggleExpand(id) {
+      const short = document.getElementById(id + '_short');
+      const full = document.getElementById(id + '_full');
+      if (short && full) {
+        const showFull = short.style.display !== 'none';
+        short.style.display = showFull ? 'none' : '';
+        full.style.display = showFull ? '' : 'none';
+      }
+    }
+
+    function truncate(text, max = 200) {
+      if (!text || text.length <= max) return text || '';
+      return text.substring(0, max) + '…';
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    loadSessions();
   </script>
 </body>
 </html>`;
@@ -1723,7 +2387,7 @@ function handleRequest(
           try {
             const embeddingsService = await getEmbeddingsService();
             const result = await embeddingsService.embed(data.content);
-            embeddingBuffer = Buffer.from(result.embedding.buffer);
+            embeddingBuffer = Buffer.from(result.embedding);
           } catch (e) {
             console.warn('[WebViewer] Failed to generate embedding:', e);
           }
@@ -1825,7 +2489,7 @@ function handleRequest(
           try {
             const embeddingsService = await getEmbeddingsService();
             const result = await embeddingsService.embed(data.content);
-            embeddingBuffer = Buffer.from(result.embedding.buffer);
+            embeddingBuffer = Buffer.from(result.embedding);
           } catch (e) {
             console.warn('[WebViewer] Failed to generate embedding:', e);
           }
@@ -1914,7 +2578,7 @@ function handleRequest(
           for (const entry of entries) {
             try {
               const result = await embeddingsService.embed(entry.content);
-              const embeddingBuffer = Buffer.from(result.embedding.buffer);
+              const embeddingBuffer = Buffer.from(result.embedding);
               updateStmt.run(embeddingBuffer, Date.now(), entry.id);
               success++;
             } catch (e) {
@@ -1938,6 +2602,317 @@ function handleRequest(
       return;
     }
 
+    // GET session hybrid search
+    if (url.pathname === '/api/sessions/search' && method === 'GET') {
+      const query = url.searchParams.get('q') || '';
+      const searchType = (url.searchParams.get('type') || 'hybrid') as 'hybrid' | 'text' | 'vector';
+      const limit = parseInt(url.searchParams.get('limit') || '30', 10);
+
+      searchSessionsHybrid(db, query, { type: searchType, limit })
+        .then((results) => {
+          res.writeHead(200);
+          res.end(JSON.stringify(results));
+        })
+        .catch((error) => {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'Search failed' }));
+        });
+      return;
+    }
+
+    // GET session embeddings stats
+    if (url.pathname === '/api/sessions/embeddings/stats' && method === 'GET') {
+      try {
+        const stats: Record<string, { total: number; withEmbedding: number }> = {};
+        for (const table of ['observations', 'user_prompts', 'session_summaries'] as const) {
+          const total = (db.prepare(`SELECT COUNT(*) as c FROM ${table}`).get() as { c: number }).c;
+          const withEmb = (db.prepare(`SELECT COUNT(*) as c FROM ${table} WHERE embedding IS NOT NULL AND LENGTH(embedding) > 0`).get() as { c: number }).c;
+          stats[table] = { total, withEmbedding: withEmb };
+        }
+        res.writeHead(200);
+        res.end(JSON.stringify(stats));
+      } catch (error) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: String(error) }));
+      }
+      return;
+    }
+
+    // POST generate session embeddings
+    if (url.pathname === '/api/sessions/embeddings/generate' && method === 'POST') {
+      readBody(req).then(async (body) => {
+        try {
+          const opts = JSON.parse(body || '{}') as { mode?: 'missing' | 'all' };
+          const mode = opts.mode || 'missing';
+          const embeddingsService = await getEmbeddingsService();
+
+          let totalSuccess = 0, totalFailed = 0;
+          const tableConfigs = [
+            { name: 'observations' as const, idCol: 'id' },
+            { name: 'user_prompts' as const, idCol: 'id' },
+            { name: 'session_summaries' as const, idCol: 'id' },
+          ];
+
+          for (const { name, idCol } of tableConfigs) {
+            const where = mode === 'missing' ? 'WHERE embedding IS NULL OR LENGTH(embedding) = 0' : '';
+            const rows = db.prepare(`SELECT * FROM ${name} ${where}`).all() as Record<string, unknown>[];
+            const updateStmt = db.prepare(`UPDATE ${name} SET embedding = ? WHERE ${idCol} = ?`);
+
+            for (const row of rows) {
+              const text = getSessionEmbeddingText(name, row);
+              if (!text) { totalFailed++; continue; }
+              try {
+                const result = await embeddingsService.embed(text);
+                const buffer = Buffer.from(result.embedding);
+                updateStmt.run(buffer, row[idCol]);
+                totalSuccess++;
+              } catch { totalFailed++; }
+            }
+          }
+
+          res.writeHead(200);
+          res.end(JSON.stringify({
+            processed: totalSuccess + totalFailed,
+            success: totalSuccess,
+            failed: totalFailed,
+          }));
+        } catch (error) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'Generation failed' }));
+        }
+      }).catch(() => {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'Invalid request body' }));
+      });
+      return;
+    }
+
+    // GET sessions data (sessions, prompts, summaries) - all in memory.db now
+    if (url.pathname === '/api/sessions' && method === 'GET') {
+      const limit = parseInt(url.searchParams.get('limit') || '20', 10);
+      const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+      const query = url.searchParams.get('q') || '';
+
+      // Strip embedding BLOBs and add hasEmbedding flag
+      const stripEmb = (rows: Record<string, unknown>[]) =>
+        rows.map(r => ({ ...r, hasEmbedding: !!(r.embedding && (r.embedding as Buffer).length > 0), embedding: undefined }));
+
+      try {
+        let sessions: Record<string, unknown>[];
+        if (query) {
+          const pattern = `%${query}%`;
+          sessions = db.prepare(`
+            SELECT * FROM sessions WHERE session_id LIKE ? OR project LIKE ? OR prompt LIKE ? OR summary LIKE ?
+            ORDER BY started_at DESC LIMIT ? OFFSET ?
+          `).all(pattern, pattern, pattern, pattern, limit, offset) as Record<string, unknown>[];
+        } else {
+          sessions = db.prepare(`
+            SELECT * FROM sessions ORDER BY started_at DESC LIMIT ? OFFSET ?
+          `).all(limit, offset) as Record<string, unknown>[];
+        }
+
+        // user_prompts
+        let prompts: Record<string, unknown>[] = [];
+        try {
+          if (query) {
+            const pattern = `%${query}%`;
+            prompts = stripEmb(db.prepare(`
+              SELECT up.*, s.project FROM user_prompts up
+              JOIN sessions s ON s.session_id = up.session_id
+              WHERE up.prompt_text LIKE ?
+              ORDER BY up.created_at DESC LIMIT ? OFFSET ?
+            `).all(pattern, limit, offset) as Record<string, unknown>[]);
+          } else {
+            prompts = stripEmb(db.prepare(`
+              SELECT up.*, s.project FROM user_prompts up
+              JOIN sessions s ON s.session_id = up.session_id
+              ORDER BY up.created_at DESC LIMIT ? OFFSET ?
+            `).all(limit, offset) as Record<string, unknown>[]);
+          }
+        } catch { /* table may not exist */ }
+
+        // session_summaries
+        let summaries: Record<string, unknown>[] = [];
+        try {
+          if (query) {
+            const pattern = `%${query}%`;
+            summaries = stripEmb(db.prepare(`
+              SELECT * FROM session_summaries WHERE request LIKE ? OR completed LIKE ? OR notes LIKE ? OR next_steps LIKE ?
+              ORDER BY created_at DESC LIMIT ? OFFSET ?
+            `).all(pattern, pattern, pattern, pattern, limit, offset) as Record<string, unknown>[]);
+          } else {
+            summaries = stripEmb(db.prepare(`
+              SELECT * FROM session_summaries ORDER BY created_at DESC LIMIT ? OFFSET ?
+            `).all(limit, offset) as Record<string, unknown>[]);
+          }
+        } catch { /* table may not exist */ }
+
+        res.writeHead(200);
+        res.end(JSON.stringify({ sessions, prompts, summaries }));
+      } catch (error) {
+        res.writeHead(200);
+        res.end(JSON.stringify({ sessions: [], prompts: [], summaries: [], error: String(error) }));
+      }
+      return;
+    }
+
+    // GET observations from memory.db
+    if (url.pathname === '/api/observations' && method === 'GET') {
+      const limit = parseInt(url.searchParams.get('limit') || '50', 10);
+      const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+      const sessionId = url.searchParams.get('session_id') || undefined;
+      const query = url.searchParams.get('q') || '';
+
+      // Strip embedding BLOBs and add hasEmbedding flag
+      const stripEmb = (rows: Record<string, unknown>[]) =>
+        rows.map(r => ({ ...r, hasEmbedding: !!(r.embedding && (r.embedding as Buffer).length > 0), embedding: undefined }));
+
+      try {
+        let rows: Record<string, unknown>[];
+        if (query) {
+          const pattern = `%${query}%`;
+          if (sessionId) {
+            rows = db.prepare(`
+              SELECT * FROM observations WHERE session_id = ? AND (tool_name LIKE ? OR title LIKE ? OR subtitle LIKE ? OR narrative LIKE ?)
+              ORDER BY timestamp DESC LIMIT ? OFFSET ?
+            `).all(sessionId, pattern, pattern, pattern, pattern, limit, offset) as Record<string, unknown>[];
+          } else {
+            rows = db.prepare(`
+              SELECT * FROM observations WHERE tool_name LIKE ? OR title LIKE ? OR subtitle LIKE ? OR narrative LIKE ?
+              ORDER BY timestamp DESC LIMIT ? OFFSET ?
+            `).all(pattern, pattern, pattern, pattern, limit, offset) as Record<string, unknown>[];
+          }
+        } else if (sessionId) {
+          rows = db.prepare(`
+            SELECT * FROM observations WHERE session_id = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?
+          `).all(sessionId, limit, offset) as Record<string, unknown>[];
+        } else {
+          rows = db.prepare(`
+            SELECT * FROM observations ORDER BY timestamp DESC LIMIT ? OFFSET ?
+          `).all(limit, offset) as Record<string, unknown>[];
+        }
+        res.writeHead(200);
+        res.end(JSON.stringify(stripEmb(rows)));
+      } catch {
+        res.writeHead(200);
+        res.end(JSON.stringify([]));
+      }
+      return;
+    }
+
+    // ===== Hook API Endpoints =====
+
+    // GET /api/hook/sessions - List hook sessions
+    if (url.pathname === '/api/hook/sessions' && method === 'GET') {
+      const project = url.searchParams.get('project') || undefined;
+      const limit = parseInt(url.searchParams.get('limit') || '20', 10);
+      try {
+        let rows: Record<string, unknown>[];
+        if (project) {
+          rows = db.prepare(
+            'SELECT * FROM sessions WHERE project = ? ORDER BY started_at DESC LIMIT ?'
+          ).all(project, limit) as Record<string, unknown>[];
+        } else {
+          rows = db.prepare(
+            'SELECT * FROM sessions ORDER BY started_at DESC LIMIT ?'
+          ).all(limit) as Record<string, unknown>[];
+        }
+        res.writeHead(200);
+        res.end(JSON.stringify(rows));
+      } catch (error) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: String(error) }));
+      }
+      return;
+    }
+
+    // GET /api/hook/observations - List hook observations
+    if (url.pathname === '/api/hook/observations' && method === 'GET') {
+      const project = url.searchParams.get('project') || undefined;
+      const limit = parseInt(url.searchParams.get('limit') || '50', 10);
+      try {
+        let rows: Record<string, unknown>[];
+        if (project) {
+          rows = db.prepare(
+            'SELECT id, session_id, project, tool_name, timestamp, type, title, subtitle, narrative, facts, concepts, prompt_number, compressed_summary, is_compressed FROM observations WHERE project = ? ORDER BY timestamp DESC LIMIT ?'
+          ).all(project, limit) as Record<string, unknown>[];
+        } else {
+          rows = db.prepare(
+            'SELECT id, session_id, project, tool_name, timestamp, type, title, subtitle, narrative, facts, concepts, prompt_number, compressed_summary, is_compressed FROM observations ORDER BY timestamp DESC LIMIT ?'
+          ).all(limit) as Record<string, unknown>[];
+        }
+        res.writeHead(200);
+        res.end(JSON.stringify(rows));
+      } catch (error) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: String(error) }));
+      }
+      return;
+    }
+
+    // GET /api/hook/session/:id - Session detail with observations and prompts
+    if (url.pathname.startsWith('/api/hook/session/') && method === 'GET') {
+      const sessionId = url.pathname.slice('/api/hook/session/'.length);
+      try {
+        const session = db.prepare('SELECT * FROM sessions WHERE session_id = ?').get(sessionId);
+        if (!session) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: 'Session not found' }));
+          return;
+        }
+        const observations = db.prepare(
+          'SELECT id, tool_name, timestamp, type, title, subtitle, narrative, facts, concepts, prompt_number, compressed_summary, is_compressed FROM observations WHERE session_id = ? ORDER BY timestamp ASC'
+        ).all(sessionId);
+        const prompts = db.prepare(
+          'SELECT * FROM user_prompts WHERE session_id = ? ORDER BY prompt_number ASC'
+        ).all(sessionId);
+        const summary = db.prepare(
+          'SELECT * FROM session_summaries WHERE session_id = ? ORDER BY created_at DESC LIMIT 1'
+        ).get(sessionId);
+
+        res.writeHead(200);
+        res.end(JSON.stringify({ session, observations, prompts, summary }));
+      } catch (error) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: String(error) }));
+      }
+      return;
+    }
+
+    // GET /api/hook/queue/status - Task queue stats
+    if (url.pathname === '/api/hook/queue/status' && method === 'GET') {
+      try {
+        const stats = db.prepare(`
+          SELECT task_type, status, COUNT(*) as count
+          FROM task_queue
+          GROUP BY task_type, status
+        `).all();
+        const total = (db.prepare('SELECT COUNT(*) as c FROM task_queue').get() as { c: number }).c;
+        res.writeHead(200);
+        res.end(JSON.stringify({ total, breakdown: stats }));
+      } catch (error) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: String(error) }));
+      }
+      return;
+    }
+
+    // POST /api/hook/cleanup - Clean old completed/failed queue tasks
+    if (url.pathname === '/api/hook/cleanup' && method === 'POST') {
+      try {
+        const oneDayAgo = Date.now() - 86400000;
+        const result = db.prepare(
+          "DELETE FROM task_queue WHERE status IN ('completed', 'failed') OR (status = 'processing' AND created_at < ?)"
+        ).run(oneDayAgo);
+        res.writeHead(200);
+        res.end(JSON.stringify({ deleted: result.changes }));
+      } catch (error) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: String(error) }));
+      }
+      return;
+    }
+
     res.writeHead(404);
     res.end(JSON.stringify({ error: 'Not found' }));
   } catch (error) {
@@ -1954,3 +2929,14 @@ server.listen(PORT, () => {
   console.log(`  Database: ${dbPath}\n`);
   console.log(`  Press Ctrl+C to stop\n`);
 });
+
+// Graceful shutdown: close server, DB, and embeddings service on SIGINT/SIGTERM
+function cleanup() {
+  server.close();
+  if (_db) { try { _db.close(); } catch { /* ignore */ } _db = null; }
+  if (_embeddingsService) { _embeddingsService = null; }
+  if (_searchEngine) { _searchEngine = null; }
+  process.exit(0);
+}
+process.on('SIGINT', cleanup);
+process.on('SIGTERM', cleanup);

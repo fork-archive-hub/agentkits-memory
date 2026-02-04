@@ -47,22 +47,51 @@ export class ContextHook implements EventHandler {
       // Initialize service
       await this.service.initialize();
 
+      // Catch-up: spawn workers if stale pending tasks exist from previous sessions
+      try {
+        if (this.service.hasPendingEmbeddings()) {
+          this.service.ensureWorkerRunning(input.cwd, 'embed-session', 'embed-worker.lock');
+        }
+        if (this.service.hasPendingEnrichments()) {
+          this.service.ensureWorkerRunning(input.cwd, 'enrich-session', 'enrich-worker.lock');
+        }
+        if (this.service.hasPendingCompressions()) {
+          this.service.ensureWorkerRunning(input.cwd, 'compress-session', 'compress-worker.lock');
+        }
+      } catch { /* non-critical — don't block context injection */ }
+
       // Get context for this project
       const context = await this.service.getContext(input.project);
+      const hasHistory = context.markdown && !context.markdown.includes('No previous session context');
 
-      // No context to inject
-      if (!context.markdown || context.markdown.includes('No previous session context')) {
+      // Display status to user via stderr (merged from user-message hook)
+      const obsCount = context.recentObservations.length;
+      const sessionCount = context.sessionSummaries.length || context.previousSessions.length;
+      const promptCount = context.userPrompts.length;
+      if (obsCount > 0 || sessionCount > 0 || promptCount > 0) {
+        const stats: string[] = [];
+        if (sessionCount > 0) stats.push(`${sessionCount} session${sessionCount > 1 ? 's' : ''}`);
+        if (obsCount > 0) stats.push(`${obsCount} observation${obsCount > 1 ? 's' : ''}`);
+        if (promptCount > 0) stats.push(`${promptCount} prompt${promptCount > 1 ? 's' : ''}`);
+        console.error(`\n  AgentKits Memory: ${stats.join(', ')}\n`);
+      } else {
+        console.error('\n  AgentKits Memory: Fresh — use memory_save to start\n');
+      }
+
+      if (hasHistory) {
+        // Inject full context with history
         return {
           continue: true,
-          suppressOutput: true,
+          suppressOutput: false,
+          additionalContext: context.markdown,
         };
       }
 
-      // Inject context as additional context
+      // Empty state: still inject tool guidance so Claude knows memory tools exist
       return {
         continue: true,
         suppressOutput: false,
-        additionalContext: context.markdown,
+        additionalContext: this.buildEmptyStateGuidance(input.project),
       };
     } catch (error) {
       // Log error but don't block session
@@ -74,6 +103,36 @@ export class ContextHook implements EventHandler {
         error: error instanceof Error ? error.message : 'Unknown error',
       };
     }
+  }
+
+  /**
+   * Build guidance for empty state (no previous sessions/memories).
+   * Teaches Claude about available memory tools and proper usage order.
+   */
+  private buildEmptyStateGuidance(project: string): string {
+    return `# Memory Context - ${project}
+
+> **Memory tools available** — Use MCP tools to search and manage project memory:
+> \`memory_save\`, \`memory_recall\`, \`memory_list\`, \`memory_search\`, \`memory_timeline\`, \`memory_details\`, \`memory_update\`, \`memory_delete\`, \`memory_status\`
+
+## Getting Started
+
+No previous session context found. This is a fresh memory.
+
+**To build memory**, use \`memory_save(content, category, tags, importance)\` to store:
+- **decisions** — architectural choices, tech stack picks, trade-offs
+- **patterns** — coding conventions, project patterns, recurring approaches
+- **errors** — bug fixes, error solutions, debugging insights
+- **context** — project background, team conventions, environment setup
+
+**Important:** Do NOT call \`memory_search\`, \`memory_timeline\`, or \`memory_details\` until memories exist.
+Use \`memory_status()\` to check if memories are available before searching.
+
+**After saving**, use the 3-layer search workflow:
+1. \`memory_search(query)\` → Get index with IDs (~50 tokens/result)
+2. \`memory_timeline(anchor="ID")\` → Get context around interesting results
+3. \`memory_details(ids=["ID1","ID2"])\` → Fetch full content ONLY for filtered IDs
+`;
   }
 }
 

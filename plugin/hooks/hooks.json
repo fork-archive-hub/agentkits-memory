@@ -1,0 +1,56 @@
+{
+  "description": "AgentKits Memory - persistent memory system hooks",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/ensure-installed.cjs\"",
+            "timeout": 120
+          },
+          {
+            "type": "command",
+            "command": "npx -y -p @aitytech/agentkits-memory agentkits-memory-hook context",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx -y -p @aitytech/agentkits-memory agentkits-memory-hook session-init",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Read|Write|Edit|MultiEdit|Bash|Glob|Grep|LS|WebSearch|WebFetch|Task|Skill|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx -y -p @aitytech/agentkits-memory agentkits-memory-hook observation",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx -y -p @aitytech/agentkits-memory agentkits-memory-hook summarize",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "agentkits-memory",
+  "version": "2.2.0",
+  "description": "Persistent memory system for AI coding assistants — saves decisions, patterns, errors, and context across sessions via MCP",
+  "author": {
+    "name": "AityTech"
+  },
+  "homepage": "https://www.agentkits.net/memory",
+  "repository": "https://github.com/aitytech/agentkits-memory",
+  "license": "MIT",
+  "keywords": ["memory", "context", "persistence", "mcp", "sessions"]
+}
