@@ -2923,12 +2923,37 @@ function handleRequest(
 
 const server = http.createServer(handleRequest);
 
-server.listen(PORT, () => {
-  console.log(`\n  AgentKits Memory Viewer\n`);
-  console.log(`  Local:   http://localhost:${PORT}`);
-  console.log(`  Database: ${dbPath}\n`);
-  console.log(`  Press Ctrl+C to stop\n`);
-});
+/** Try to listen on the given port; on EADDRINUSE, pick a random available port. */
+function startServer(port: number) {
+  server.listen(port, () => {
+    const addr = server.address();
+    const actualPort = typeof addr === 'object' && addr ? addr.port : port;
+    console.log(`\n  AgentKits Memory Viewer\n`);
+    console.log(`  Local:   http://localhost:${actualPort}`);
+    console.log(`  Database: ${dbPath}\n`);
+    console.log(`  Press Ctrl+C to stop\n`);
+  });
+
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EADDRINUSE') {
+      console.log(`  Port ${port} is in use, finding an available port...`);
+      // Listen on port 0 to let the OS assign a random available port
+      server.listen(0, () => {
+        const addr = server.address();
+        const actualPort = typeof addr === 'object' && addr ? addr.port : 0;
+        console.log(`\n  AgentKits Memory Viewer\n`);
+        console.log(`  Local:   http://localhost:${actualPort}`);
+        console.log(`  Database: ${dbPath}\n`);
+        console.log(`  Press Ctrl+C to stop\n`);
+      });
+    } else {
+      console.error(`  Failed to start server: ${err.message}`);
+      process.exit(1);
+    }
+  });
+}
+
+startServer(PORT);
 
 // Graceful shutdown: close server, DB, and embeddings service on SIGINT/SIGTERM
 function cleanup() {
